@@ -819,16 +819,12 @@ async fn pump_ws(
         Err(err) => eprintln!("[ws] 桥接结束(错误): {err}"),
         Ok(_) => eprintln!("[ws] 桥接正常结束"),
     }
-    // 无论正常/异常结束，都给客户端发 Close 帧，避免 os error 10054
-    let _ = client
-        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-            code: axum::extract::ws::CloseCode::from(1000u16),
-            reason: "done".into(),
-        })))
-        .await;
+    // Close 帧已在 bridge 内部各退出路径发送，无需再发
     result
 }
 
+/// 双向桥接：client ↔ upstream
+/// 用 CancellationToken 协调两方向，确保先发 Close 帧再退出，避免 10054。
 async fn bridge(
     app: Arc<App>,
     client: &mut WebSocket,
@@ -836,106 +832,134 @@ async fn bridge(
 ) -> Result<()> {
     let (mut client_tx, mut client_rx) = client.split();
     let (mut up_tx, mut up_rx) = upstream.split();
+
     let app_up = app.clone();
     let app_down = app;
 
+    // 共享的取消标志
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_up = cancel.clone();
+    let cancel_down = cancel.clone();
+
+    // client → upstream
     let to_up = async {
-        while let Some(msg) = client_rx.next().await {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(err) => {
-                    eprintln!("[ws←client] 读取错误: {err}");
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_up.cancelled() => {
+                    eprintln!("[ws] client→upstream 收到停止信号，发 Close 给上游");
+                    let _ = up_tx.send(tungstenite::Message::Close(None)).await;
                     break;
                 }
-            };
-            match msg {
-                Message::Text(t) => {
-                    let text = maybe_stamp_ws(&app_up, t.to_string()).await;
-                    if let Err(err) = up_tx.send(tungstenite::Message::Text(text.into())).await {
-                        eprintln!("[ws→upstream] 发送错误: {err}");
-                        break;
+                msg = client_rx.next() => {
+                    let Some(msg) = msg else { break };
+                    let msg = match msg {
+                        Ok(m) => m,
+                        Err(err) => {
+                            eprintln!("[ws←client] 读取错误: {err}");
+                            break;
+                        }
+                    };
+                    match msg {
+                        Message::Text(t) => {
+                            let text = maybe_stamp_ws(&app_up, t.to_string()).await;
+                            if let Err(err) = up_tx.send(tungstenite::Message::Text(text.into())).await {
+                                eprintln!("[ws→upstream] 发送错误: {err}");
+                                break;
+                            }
+                        }
+                        Message::Binary(b) => {
+                            if let Err(err) = up_tx.send(tungstenite::Message::Binary(b)).await {
+                                eprintln!("[ws→upstream] 发送错误: {err}");
+                                break;
+                            }
+                        }
+                        Message::Ping(p) => { let _ = up_tx.send(tungstenite::Message::Ping(p)).await; }
+                        Message::Pong(p) => { let _ = up_tx.send(tungstenite::Message::Pong(p)).await; }
+                        Message::Close(c) => {
+                            let frame = c.map(|f| tungstenite::protocol::CloseFrame {
+                                code: tungstenite::protocol::frame::coding::CloseCode::from(u16::from(f.code)),
+                                reason: f.reason.to_string().into(),
+                            });
+                            let _ = up_tx.send(tungstenite::Message::Close(frame)).await;
+                            break;
+                        }
                     }
-                }
-                Message::Binary(b) => {
-                    if let Err(err) = up_tx.send(tungstenite::Message::Binary(b)).await {
-                        eprintln!("[ws→upstream] 发送错误: {err}");
-                        break;
-                    }
-                }
-                Message::Ping(p) => {
-                    let _ = up_tx.send(tungstenite::Message::Ping(p)).await;
-                }
-                Message::Pong(p) => {
-                    let _ = up_tx.send(tungstenite::Message::Pong(p)).await;
-                }
-                Message::Close(c) => {
-                    let frame = c.map(|f| tungstenite::protocol::CloseFrame {
-                        code: tungstenite::protocol::frame::coding::CloseCode::from(u16::from(
-                            f.code,
-                        )),
-                        reason: f.reason.to_string().into(),
-                    });
-                    let _ = up_tx.send(tungstenite::Message::Close(frame)).await;
-                    break;
                 }
             }
         }
+        cancel.cancel();
     };
 
+    // upstream → client
     let to_client = async {
-        while let Some(msg) = up_rx.next().await {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(err) => {
-                    eprintln!("[ws←upstream] 读取错误: {err}");
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_down.cancelled() => {
+                    eprintln!("[ws] upstream→client 收到停止信号，发 Close 给客户端");
+                    let _ = client_tx.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: axum::extract::ws::CloseCode::from(1000u16),
+                        reason: "peer finished".into(),
+                    }))).await;
                     break;
                 }
-            };
-            match msg {
-                tungstenite::Message::Text(t) => {
-                    let text = t.to_string();
-                    maybe_capture_response_ws(&app_down, &text).await;
-                    if let Err(err) = client_tx.send(Message::Text(text.into())).await {
-                        eprintln!("[ws→client] 发送错误: {err}");
+                msg = up_rx.next() => {
+                    let Some(msg) = msg else {
+                        eprintln!("[ws] 上游流结束（EOF），发 Close 给客户端");
+                        let _ = client_tx.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: axum::extract::ws::CloseCode::from(1000u16),
+                            reason: "upstream closed".into(),
+                        }))).await;
                         break;
+                    };
+                    let msg = match msg {
+                        Ok(m) => m,
+                        Err(err) => {
+                            eprintln!("[ws←upstream] 读取错误: {err}，发 Close 给客户端");
+                            let _ = client_tx.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                code: axum::extract::ws::CloseCode::from(1011u16),
+                                reason: format!("upstream error: {err}").into(),
+                            }))).await;
+                            break;
+                        }
+                    };
+                    match msg {
+                        tungstenite::Message::Text(t) => {
+                            let text = t.to_string();
+                            maybe_capture_response_ws(&app_down, &text).await;
+                            if let Err(err) = client_tx.send(Message::Text(text.into())).await {
+                                eprintln!("[ws→client] 发送错误: {err}");
+                                break;
+                            }
+                        }
+                        tungstenite::Message::Binary(b) => {
+                            if let Err(err) = client_tx.send(Message::Binary(b)).await {
+                                eprintln!("[ws→client] 发送错误: {err}");
+                                break;
+                            }
+                        }
+                        tungstenite::Message::Ping(p) => { let _ = client_tx.send(Message::Ping(p)).await; }
+                        tungstenite::Message::Pong(p) => { let _ = client_tx.send(Message::Pong(p)).await; }
+                        tungstenite::Message::Close(c) => {
+                            eprintln!("[ws] 上游发送 Close 帧，转发给客户端");
+                            let frame = c.map(|f| axum::extract::ws::CloseFrame {
+                                code: axum::extract::ws::CloseCode::from(u16::from(f.code)),
+                                reason: f.reason.to_string().into(),
+                            });
+                            let _ = client_tx.send(Message::Close(frame)).await;
+                            break;
+                        }
+                        tungstenite::Message::Frame(_) => {}
                     }
                 }
-                tungstenite::Message::Binary(b) => {
-                    if let Err(err) = client_tx.send(Message::Binary(b)).await {
-                        eprintln!("[ws→client] 发送错误: {err}");
-                        break;
-                    }
-                }
-                tungstenite::Message::Ping(p) => {
-                    let _ = client_tx.send(Message::Ping(p)).await;
-                }
-                tungstenite::Message::Pong(p) => {
-                    let _ = client_tx.send(Message::Pong(p)).await;
-                }
-                tungstenite::Message::Close(c) => {
-                    eprintln!("[ws] 上游发送 Close 帧");
-                    let frame = c.map(|f| axum::extract::ws::CloseFrame {
-                        code: axum::extract::ws::CloseCode::from(u16::from(f.code)),
-                        reason: f.reason.to_string().into(),
-                    });
-                    let _ = client_tx.send(Message::Close(frame)).await;
-                    break;
-                }
-                tungstenite::Message::Frame(_) => {}
             }
         }
+        cancel_down.cancel();
     };
 
-    // 任一方向结束后，优雅关闭另一方向，而不是直接丢弃
-    tokio::select! {
-        _ = to_up => {
-            eprintln!("[ws] client→upstream 方向结束，关闭 upstream→client");
-        },
-        _ = to_client => {
-            eprintln!("[ws] upstream→client 方向结束，关闭 client→upstream");
-        },
-    }
-    // split 的两半在这里 drop，释放底层连接供 pump_ws 发 Close 帧
+    // 两个方向同时运行，都结束后才返回
+    tokio::join!(to_up, to_client);
     Ok(())
 }
 
