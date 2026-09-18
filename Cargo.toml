@@ -1,0 +1,46 @@
+[package]
+name = "codex-state-kit"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+description = "Transparent local reverse proxy for Codex HTTP and WebSocket"
+exclude = ["frontend", "dist", "node_modules"]
+
+[lib]
+name = "codex_state_kit"
+path = "src/lib.rs"
+
+[workspace]
+members = ["src-tauri"]
+resolver = "2"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+futures-util = "0.3"
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "socks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+toml = "0.8"
+toml_edit = "0.22"
+base64 = "0.22"
+url = "2"
+rand = "0.9"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+strip = "symbols"

@@ -1,0 +1,26 @@
+[package]
+name = "codex-state-kit-desktop"
+version = "0.0.1"
+description = "Desktop manager for the Codex reverse proxy"
+edition = "2021"
+rust-version = "1.85"
+
+[lib]
+name = "codex_state_kit_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "codex-state-kit-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+codex-state-kit = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+thiserror = "2"
+anyhow = "1"
+open = "5"

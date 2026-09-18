@@ -1,0 +1,63 @@
+mod commands;
+mod error;
+mod state;
+
+use tauri::{Manager, RunEvent};
+
+use codex_state_kit::warp::WarpPaths;
+use state::AppState;
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .setup(|app| {
+            let resource_dir = app.path().resource_dir()?;
+            let binary = if cfg!(debug_assertions) {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("resources/warp/usque.exe")
+            } else {
+                resource_dir.join("warp/usque.exe")
+            };
+            let mut data_dir = app.path().app_local_data_dir()?;
+            if cfg!(debug_assertions) {
+                data_dir.push("dev");
+            }
+            data_dir.push("warp");
+            let state = AppState::initialize(WarpPaths { binary, data_dir })
+                .map_err(|err| err.to_string())?;
+            let proxy = state.proxy.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = proxy.start_managed().await {
+                    eprintln!("failed to start proxy: {err:#}");
+                }
+                let attachment = proxy.clone();
+                tauri::async_runtime::spawn(async move { attachment.run_attachment_supervisor().await; });
+                proxy.run_warp_supervisor().await;
+            });
+            app.manage(state);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::get_status,
+            commands::set_config,
+            commands::refresh_turn_state,
+            commands::get_codex_config,
+            commands::get_login_status,
+            commands::start_chatgpt_login,
+            commands::poll_chatgpt_login,
+            commands::cancel_chatgpt_login,
+            commands::open_url,
+            commands::connect_warp,
+            commands::stop_warp,
+            commands::open_warp_terms,
+            commands::open_github_repo,
+        ])
+        .build(tauri::generate_context!())
+        .expect("failed to build Codex State Kit")
+        .run(|app, event| {
+            if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
+                let state = app.state::<AppState>();
+                state.restore_once();
+            }
+        });
+}

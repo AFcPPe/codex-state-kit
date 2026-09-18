@@ -1,0 +1,327 @@
+import { useEffect, useRef, useState } from "react";
+import Copy from "lucide-react/dist/esm/icons/copy.js";
+import ExternalLink from "lucide-react/dist/esm/icons/external-link.js";
+import LogIn from "lucide-react/dist/esm/icons/log-in.js";
+import Shield from "lucide-react/dist/esm/icons/shield.js";
+import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
+import Activity from "lucide-react/dist/esm/icons/activity.js";
+import Network from "lucide-react/dist/esm/icons/network.js";
+import Terminal from "lucide-react/dist/esm/icons/terminal.js";
+import CircleCheck from "lucide-react/dist/esm/icons/circle-check.js";
+import Radio from "lucide-react/dist/esm/icons/radio.js";
+import Cloud from "lucide-react/dist/esm/icons/cloud.js";
+import { AppShell } from "@/components/AppShell";
+import { WarpPanel } from "@/components/WarpPanel";
+import { useCodexStateKit } from "@/hooks/useCodexStateKit";
+import type { LoginMethod, Status, TurnStateView } from "@/types";
+
+function chipLabel(status: Status) {
+  if (status.attached) return "已接入";
+  return status.proxyOk ? "代理已开" : "代理未开";
+}
+
+function chipClass(status: Status) {
+  if (status.attached) return "runtime-chip runtime-chip--accent";
+  return status.proxyOk ? "runtime-chip" : "runtime-chip runtime-chip--down";
+}
+
+function tokenChip(view?: TurnStateView | null) {
+  if (!view || view.status === "empty") return { label: "等待 Token", className: "runtime-chip runtime-chip--idle" };
+  if (view.status === "active") return { label: "Token 可用", className: "runtime-chip" };
+  return { label: "Token 已过期", className: "runtime-chip runtime-chip--warm" };
+}
+
+function degradeChip(status: Status) {
+  if (!status.degraded) return null;
+  return { label: "312 降智", className: "runtime-chip runtime-chip--down" };
+}
+
+function formatAge(secs?: number | null) {
+  if (secs == null) return null;
+  if (secs < 0) return "刚刚";
+  if (secs < 60) return `${secs} 秒前`;
+  if (secs < 3600) return `${Math.floor(secs / 60)} 分钟前`;
+  return `${Math.floor(secs / 3600)} 小时前`;
+}
+
+function tokenCopy(view?: TurnStateView | null, fetchError?: string | null) {
+  if (fetchError && (!view || view.status !== "active")) {
+    return {
+      title: "正在获取 292 Token…",
+      body: fetchError,
+      loading: true,
+    };
+  }
+  if (!view || view.status === "empty") {
+    return {
+      title: "等待 Token 就绪",
+      body: "登录后自动获取 Token，并在需要时刷新。",
+      loading: false,
+    };
+  }
+  if (view.status === "active") {
+    return {
+      title: "292 Token 正在复用",
+      body: "",
+      loading: false,
+    };
+  }
+  return {
+    title: "等待刷新 Token",
+    body: "Token 已超过约 30 分钟，等待 StateKit 通过出站代理重新获取。",
+    loading: true,
+  };
+}
+
+function formatLogs(status: Status) {
+  if (!status.logs.length) return "等待流量…";
+  return status.logs
+    .map((entry) => `${entry.ts}  ${entry.method.padEnd(6)} ${entry.status} ${entry.ms}ms  ${entry.path}`)
+    .join("\n");
+}
+
+export default function App() {
+  const fwd = useCodexStateKit();
+  const [codexHome, setCodexHome] = useState("");
+  const [outboundProxy, setOutboundProxy] = useState("");
+  const [loginMethod, setLoginMethod] = useState<LoginMethod>("browser");
+  const hydrated = useRef(false);
+
+  useEffect(() => {
+    if (!fwd.status || hydrated.current) return;
+    hydrated.current = true;
+    setCodexHome(fwd.status.codexHome);
+    setOutboundProxy(fwd.status.outboundProxy ?? "");
+  }, [fwd.status]);
+
+
+  if (!fwd.status) {
+    return (
+      <AppShell>
+        <div className="boot-screen">
+          {fwd.error ? (
+            <div className="boot-screen__error" role="alert">
+              <strong>无法启动 Codex State Kit</strong>
+              <p>{fwd.error}</p>
+              <button className="button button--primary" type="button" onClick={() => void fwd.refresh()}>
+                重试
+              </button>
+            </div>
+          ) : (
+            <>
+              <span className="spinner spinner--blue" />
+              正在启动…
+            </>
+          )}
+        </div>
+      </AppShell>
+    );
+  }
+
+  const loggedIn = Boolean(fwd.login?.loggedIn);
+  const loginLabel = fwd.login?.email || fwd.login?.accountId || "ChatGPT";
+  const turn = fwd.status.turnState;
+  const token = tokenChip(turn);
+  const degrade = degradeChip(fwd.status);
+  const copy = tokenCopy(turn, fwd.status.outboundMode === "warp" && fwd.status.warp.phase !== "connected" ? null : fwd.status.fetchError);
+  const age = formatAge(turn?.ageSecs);
+  const sourceLabel =
+    turn?.source === "fetch" ? "StateKit 获取" : turn?.source === "ws" ? "WebSocket" : turn?.source === "http" ? "HTTP" : null;
+  const meta = [age, turn?.len ? `${turn.len} 字节` : null, sourceLabel].filter(Boolean).join(" · ");
+
+  const copyCode = async () => {
+    if (!fwd.device?.userCode) return;
+    try {
+      await navigator.clipboard.writeText(fwd.device.userCode);
+    } catch {
+      // ignore
+    }
+  };
+
+  return (
+    <AppShell>
+      <div className="dash-page">
+        <div className="page-heading">
+          <div>
+            <h1>Codex 稳定助手</h1>
+            <p>自动维护 Token，缓解负载与降智问题。</p>
+          </div>
+          <div className="page-actions">
+            <span className={chipClass(fwd.status)}>
+              <i />
+              {chipLabel(fwd.status)}
+            </span>
+            <span className={token.className}>
+              <i />
+              {token.label}
+            </span>
+            {degrade ? (
+              <span className={degrade.className}>
+                <i />
+                {degrade.label}
+              </span>
+            ) : null}
+          </div>
+        </div>
+
+        {fwd.status.proxyError ? (
+          <div className="banner banner--error" role="alert">
+            <span>{fwd.status.proxyError}</span>
+          </div>
+        ) : null}
+
+        {fwd.status.attachError ? <div className="banner banner--error" role="alert">{fwd.status.attachError}</div> : null}
+
+        {fwd.banner ? (
+          <div className={`banner banner--${fwd.banner.kind}`} role="status">
+            <span>{fwd.banner.text}</span>
+            <button type="button" onClick={fwd.dismissBanner}>
+              关闭
+            </button>
+          </div>
+        ) : null}
+
+        <section className={`token-card token-card--${turn?.status || "empty"}`}>
+          <div className="token-card__head">
+            <span className="token-card__icon" aria-hidden="true">
+              {copy.loading ? <span className="spinner spinner--blue" /> : <Shield size={25} strokeWidth={1.7} />}
+            </span>
+            <div>
+              <span className="token-card__eyebrow">TOKEN 状态</span>
+              <strong>{copy.title}</strong>
+              {copy.body ? <small>{copy.body}</small> : null}
+              {meta ? <p className="token-card__meta">{meta}</p> : null}
+            </div>
+          </div>
+          <span className="token-card__badge"><Radio size={14} /> {fwd.status.proxyOk ? "后台自动管理" : "等待代理启动"}</span>
+          {fwd.status.fetchError && turn?.status === "active" ? (
+            <p className="token-card__meta token-card__meta--warn">刷新失败：{fwd.status.fetchError}</p>
+          ) : null}
+        </section>
+
+        {fwd.status.degraded ? (
+          <div className="banner banner--error" role="alert">
+            <span>
+              <TriangleAlert size={14} style={{ verticalAlign: "middle", marginRight: 4 }} />
+              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}，正在通过出站代理重新采集 292 token…
+            </span>
+          </div>
+        ) : null}
+
+        <div className="panel dash-grid">
+        <section className="connection-section panel--proxy">
+          <header>
+            <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>出站代理</h2><p>为 Token 获取配置网络</p></div></div>
+            <span className="section-step">01</span>
+          </header>
+          <div className="proxy-mode" role="group" aria-label="出站代理模式">
+            <button type="button" aria-pressed={fwd.status.outboundMode === "warp"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "warp")}><Cloud size={15} />内置 WARP</button>
+            <button type="button" aria-pressed={fwd.status.outboundMode === "manual"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "manual")}><Network size={14} />手动代理</button>
+          </div>
+          {fwd.status.outboundMode === "manual" ? <>
+          <label className="field">
+            <span>代理 URL</span>
+            <input
+              type="text"
+              spellCheck={false}
+              autoComplete="off"
+              disabled={fwd.busy !== null}
+              value={outboundProxy}
+              placeholder="http://127.0.0.1:7890"
+              onChange={(event) => setOutboundProxy(event.target.value)}
+              onBlur={() => void fwd.saveSettings(codexHome, outboundProxy)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void fwd.saveSettings(codexHome, outboundProxy);
+              }}
+            />
+          </label>
+          <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。</p>
+          </> : <WarpPanel status={fwd.status.warp} onTerms={() => void fwd.openWarpTerms()} />}
+        </section>
+
+        <section className="connection-section">
+          <header>
+            <div className="section-heading"><span className="section-icon section-icon--warm"><Terminal size={19} /></span><div><h2>Codex 接入</h2><p>登录账号，连接你的客户端</p></div></div>
+            <span className="section-step">02</span>
+          </header>
+          <div className="proxy-mode" role="group" aria-label="登录方式">
+            <button type="button" aria-pressed={loginMethod === "browser"} disabled={fwd.busy !== null || Boolean(fwd.device)} onClick={() => setLoginMethod("browser")}><ExternalLink size={14} />浏览器回调</button>
+            <button type="button" aria-pressed={loginMethod === "device"} disabled={fwd.busy !== null || Boolean(fwd.device)} onClick={() => setLoginMethod("device")}><Copy size={14} />授权码登录</button>
+          </div>
+          <div className="login-box">
+            <span className="field-label">ChatGPT 账号 {loggedIn && !fwd.device ? <span className="account-status"><CircleCheck size={12} /> 已登录</span> : null}</span>
+            {fwd.device ? (
+              <div className="login-pending">
+                <p>{fwd.device.method === "browser" ? "请在浏览器完成授权，登录结果将自动同步。" : "在浏览器打开验证页并输入代码"}</p>
+                {fwd.device.method === "device" ? <div className="user-code">{fwd.device.userCode}</div> : null}
+                <div className="panel__actions">
+                  {fwd.device.method === "device" ? <button className="button button--secondary" type="button" onClick={() => void copyCode()}>
+                    <Copy size={14} />
+                    复制
+                  </button> : null}
+                  <button className="button button--secondary" type="button" onClick={() => void fwd.openLoginPage()}>
+                    <ExternalLink size={14} />
+                    打开页面
+                  </button>
+                  <button className="button button--ghost" type="button" onClick={() => void fwd.cancelLogin()}>
+                    取消
+                  </button>
+                </div>
+              </div>
+            ) : loggedIn ? (
+              <div className="login-current">
+                <div>
+                  <strong>{loginLabel}</strong>
+                  {fwd.login?.accountId && fwd.login.email ? (
+                    <span className="login-meta">{fwd.login.accountId}</span>
+                  ) : null}
+                </div>
+                <button
+                  className="button button--ghost"
+                  type="button"
+                  disabled={fwd.busy !== null}
+                  onClick={() => void fwd.startLogin(codexHome, loginMethod)}
+                >
+                  {fwd.busy === "login" ? <span className="spinner" /> : <LogIn size={14} />}
+                  重新登录
+                </button>
+              </div>
+            ) : (
+              <div className="login-current">
+                <span>尚未登录 ChatGPT</span>
+                <button
+                  className="button button--primary"
+                  type="button"
+                  disabled={fwd.busy !== null}
+                  onClick={() => void fwd.startLogin(codexHome, loginMethod)}
+                >
+                  {fwd.busy === "login" ? <span className="spinner" /> : <LogIn size={14} />}
+                  登录 ChatGPT
+                </button>
+              </div>
+            )}
+          </div>
+          <p className="panel__hint">
+            启动后自动接入，关闭时自动恢复原路由。未登录时，登录后即可自动接入。
+          </p>
+        </section>
+          <label className="field connection-directory">
+            <span>Codex 工作目录</span>
+            <input spellCheck={false} disabled={fwd.busy !== null} value={codexHome} onChange={(event) => setCodexHome(event.target.value)}
+              onBlur={() => void fwd.saveSettings(codexHome, outboundProxy)}
+              onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} />
+          </label>
+        </div>
+
+        <section className="panel panel--traffic">
+          <header>
+            <div className="section-heading"><span className="section-icon"><Activity size={19} /></span><div><h2>请求动态</h2><p>最近经过本机代理的请求</p></div></div>
+            <span className="log-count">{fwd.status.logs.length} 条记录</span>
+          </header>
+          {fwd.status.logs.length ? <pre className="log-view" aria-label="请求日志">{formatLogs(fwd.status)}</pre> : <div className="log-empty"><span className="log-empty__icon"><Activity size={22} strokeWidth={1.5} /></span><div><strong>等待第一条请求</strong><p>Codex 发起请求后，记录会自动出现在这里。</p></div><span className="listening-label"><i /> {fwd.status.proxyOk ? "正在监听" : "监听未启动"}</span></div>}
+        </section>
+        <footer className="page-footer"><span><Shield size={13} /> 本地运行 · 配置尽在掌握</span><span>CODEX STATE KIT</span></footer>
+      </div>
+    </AppShell>
+  );
+}
