@@ -12,11 +12,13 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let resource_dir = app.path().resource_dir()?;
+            let binary_name = if cfg!(windows) { "usque.exe" } else { "usque" };
             let binary = if cfg!(debug_assertions) {
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("resources/warp/usque.exe")
+                    .join("resources/warp")
+                    .join(binary_name)
             } else {
-                resource_dir.join("warp/usque.exe")
+                resource_dir.join("warp").join(binary_name)
             };
             let mut data_dir = app.path().app_local_data_dir()?;
             if cfg!(debug_assertions) {

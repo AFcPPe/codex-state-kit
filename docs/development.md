@@ -4,7 +4,7 @@
 
 ## 环境
 
-当前内置 WARP 资源为 Windows x64，安装包验证也以该平台为准。其他平台需要另行准备对应内核并验证，不应直接复用现有 Windows 可执行文件。
+发布流程会按目标平台下载对应的 WARP 内核：Windows x64、macOS Intel 和 macOS Apple Silicon 分别使用对应二进制文件，不跨平台复用。
 
 准备 Node.js、Rust stable、C++ 构建工具和 WebView2 等 [Tauri 开发依赖](https://v2.tauri.app/start/prerequisites/)。pnpm 版本以根目录 `package.json` 的 `packageManager` 为准；以下命令使用 Corepack 调用。
 
@@ -30,11 +30,17 @@ corepack pnpm dev
 | `cargo check --workspace` | 检查 Rust 工作区编译 |
 | `cargo test -p codex-state-kit login` | 登录及相关接入测试 |
 | `corepack pnpm icons` | 从统一 SVG 生成应用图标 |
-| `corepack pnpm build` | 构建桌面程序及安装包 |
+| `corepack pnpm build` | 在当前系统构建桌面程序及安装包 |
 
 纯浏览器预览使用模拟接口，不会修改真实 Codex 配置或建立 WARP 隧道。桌面开发版会执行真实操作，建议使用专门的 Codex 配置目录。
 
 当前部分 Token 缓存测试会读写用户目录，且测试之间存在共享文件影响。完整测试应在隔离、可丢弃的用户环境执行；不要直接在日常账号目录运行全量测试。登录测试使用临时目录和本机模拟服务。
+
+## GitHub Actions 发布
+
+推送形如 `v0.0.1` 的标签会触发 `.github/workflows/release.yml`，并行构建 Windows x64、macOS Intel 和 macOS Apple Silicon，随后将 `.exe`、`.msi` 和 `.dmg` 上传到同一个 GitHub Release。也可以在 Actions 页面手动运行工作流。
+
+当前工作流生成未签名、未公证的 Mac 包。正式分发前，在仓库 Secrets 配置 Apple Developer 证书和公证凭据，并在工作流中接入 Tauri 的签名环境变量；否则 macOS 可能显示安全提示。
 
 ## 版本与产物
 

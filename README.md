@@ -55,6 +55,8 @@ corepack pnpm dev
 
 构建安装包使用 `corepack pnpm build`。完整说明见[开发与打包](docs/development.md)。
 
+发布版本时推送 `v` 开头的标签，例如 `v0.0.1`，GitHub Actions 会自动构建并发布 Windows 与 macOS 安装包。
+
 ## 第三方组件
 
 内置 WARP 使用第三方开源内核 usque，来源和许可证见[内核来源记录](src-tauri/resources/warp/PROVENANCE.md)。上游许可证与依赖声明保留原文。
