@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "codex-state-kit"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -436,13 +436,14 @@ dependencies = [
  "toml 0.8.23",
  "toml_edit 0.22.27",
  "url",
+ "uuid",
  "windows-sys 0.61.2",
  "zstd",
 ]
 
 [[package]]
 name = "codex-state-kit-desktop"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "codex-state-kit",

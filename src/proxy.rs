@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -39,6 +39,71 @@ fn debug_log(msg: &str) {
         let ts = chrono::Local::now().format("%H:%M:%S%.3f");
         let _ = writeln!(f, "[{}] {}", ts, msg);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FetchRetryClass {
+    Normal,
+    Backoff,
+    Auth,
+    Stale,
+}
+
+#[derive(Debug)]
+struct FetchOnceError {
+    message: String,
+    retry: FetchRetryClass,
+}
+
+impl FetchOnceError {
+    fn new(message: impl Into<String>, retry: FetchRetryClass) -> Self {
+        Self {
+            message: message.into(),
+            retry,
+        }
+    }
+}
+
+impl std::fmt::Display for FetchOnceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FetchOnceError {}
+
+fn fetch_retry_delay(class: FetchRetryClass) -> Duration {
+    match class {
+        FetchRetryClass::Normal => fetch::RETRY_INTERVAL,
+        FetchRetryClass::Backoff => fetch::ERROR_BACKOFF,
+        FetchRetryClass::Auth => fetch::AUTH_BACKOFF,
+        FetchRetryClass::Stale => fetch::RETRY_INTERVAL,
+    }
+}
+
+fn classify_fetch_failure(details: &NetworkLogDetails) -> FetchRetryClass {
+    match details.response_status {
+        Some(401 | 403) => FetchRetryClass::Auth,
+        Some(429 | 503) => FetchRetryClass::Backoff,
+        _ if details.error_kind.as_deref() == Some("connect") => FetchRetryClass::Backoff,
+        _ => FetchRetryClass::Normal,
+    }
+}
+
+fn model_for_fetch_round(models: &[String], round: u32) -> Option<&str> {
+    if models.is_empty() {
+        return None;
+    }
+    Some(models[(round.saturating_sub(1) as usize) % models.len()].as_str())
+}
+
+fn capture_fetched_ticket(store: &mut TurnStateStore, model: &str, token: &str) -> bool {
+    if !store.capture(model, token, "fetch") {
+        return false;
+    }
+    token.trim().len() == store.bound_len_for(model)
+        && store.peek_for_model(model).as_deref() == Some(token.trim())
+        && !store.needs_refresh(model)
 }
 
 const HOP_BY_HOP: &[&str] = &[
@@ -88,6 +153,11 @@ pub struct App {
     fetch_error: Mutex<Option<String>>,
     fetch_ok_at: Mutex<Option<String>>,
     fetch_round: AtomicU32,
+    fetch_gate: Mutex<()>,
+    fetch_next_allowed_at: Mutex<Instant>,
+    fetch_generation: AtomicU64,
+    fetch_change_notify: Notify,
+    fetch_transition: Mutex<()>,
     turn_state: Mutex<TurnStateStore>,
     http: Mutex<reqwest::Client>,
     degraded: AtomicBool,
@@ -118,6 +188,11 @@ impl App {
             fetch_error: Mutex::new(None),
             fetch_ok_at: Mutex::new(None),
             fetch_round: AtomicU32::new(0),
+            fetch_gate: Mutex::new(()),
+            fetch_next_allowed_at: Mutex::new(Instant::now()),
+            fetch_generation: AtomicU64::new(0),
+            fetch_change_notify: Notify::new(),
+            fetch_transition: Mutex::new(()),
             turn_state: Mutex::new(TurnStateStore::load()),
             http: Mutex::new(http),
             degraded: AtomicBool::new(false),
@@ -130,16 +205,29 @@ impl App {
     }
 
     async fn sync_logged_in_account(&self) {
+        let _transition = self.fetch_transition.lock().await;
         let home = self.settings.lock().await.codex_home.clone();
         let Ok(creds) = login::chatgpt_credentials(Path::new(&home)) else {
             return;
         };
-        let changed = self.turn_state.lock().await.bind_account(&creds.account_id);
-        if changed {
-            self.seeds_registered.store(false, Ordering::Relaxed);
-            *self.fetch_error.lock().await = None;
-            self.model_notify.notify_one();
+        let needs_change = !self
+            .turn_state
+            .lock()
+            .await
+            .is_bound_to_account(&creds.account_id);
+        if !needs_change {
+            return;
         }
+        self.fetch_generation.fetch_add(1, Ordering::SeqCst);
+        self.fetch_change_notify.notify_waiters();
+        let _gate = self.fetch_gate.lock().await;
+        self.turn_state.lock().await.bind_account(&creds.account_id);
+        self.fetch_generation.fetch_add(1, Ordering::SeqCst);
+        self.seeds_registered.store(false, Ordering::Relaxed);
+        *self.fetch_error.lock().await = None;
+        *self.fetch_ok_at.lock().await = None;
+        *self.fetch_next_allowed_at.lock().await = Instant::now();
+        self.model_notify.notify_one();
     }
 
     pub async fn status(&self) -> Status {
@@ -173,17 +261,21 @@ impl App {
     }
 
     pub async fn refresh_turn_state(&self) -> Result<Status> {
+        self.sync_logged_in_account().await;
         let settings = self.settings.lock().await.clone();
-        let mut last_error: Option<anyhow::Error> = None;
-        for model in &settings.models {
-            if let Err(e) = self.fetch_once(&settings, model).await {
-                eprintln!("[refresh] 模型 {} 获取失败: {e:#}", model);
-                last_error = Some(e);
-            }
+        let mut models = settings.models.clone();
+        if models.is_empty() {
+            models = self.turn_state.lock().await.all_active_models();
         }
-        if let Some(e) = last_error {
-            if settings.models.len() == 1 {
-                return Err(e);
+        if models.is_empty() {
+            let model = fetch::preferred_model(Path::new(&settings.codex_home));
+            self.turn_state.lock().await.register_model(&model);
+            models.push(model);
+        }
+        for model in &models {
+            if let Err(e) = self.fetch_once(model).await {
+                eprintln!("[refresh] 模型 {} 获取失败: {e}", model);
+                return Err(e.into());
             }
         }
         Ok(self.status().await)
@@ -191,19 +283,37 @@ impl App {
 
     /// 用户切换绑定的 token 长度（传 None 恢复账号自动识别的 292/332）
     pub async fn set_bound_token_len(&self, len: Option<usize>) -> Status {
+        let _transition = self.fetch_transition.lock().await;
+        self.fetch_generation.fetch_add(1, Ordering::SeqCst);
+        self.fetch_change_notify.notify_waiters();
+        let _gate = self.fetch_gate.lock().await;
         {
             let mut store = self.turn_state.lock().await;
             store.set_bound_len(len);
         }
+        self.fetch_generation.fetch_add(1, Ordering::SeqCst);
+        *self.fetch_next_allowed_at.lock().await = Instant::now();
+        self.fetch_change_notify.notify_waiters();
+        drop(_gate);
+        drop(_transition);
         self.degrade_notify.notify_one();
         self.status().await
     }
 
     pub async fn set_model_bound_token_len(&self, model: &str, len: Option<usize>) -> Status {
+        let _transition = self.fetch_transition.lock().await;
+        self.fetch_generation.fetch_add(1, Ordering::SeqCst);
+        self.fetch_change_notify.notify_waiters();
+        let _gate = self.fetch_gate.lock().await;
         {
             let mut store = self.turn_state.lock().await;
             store.set_model_bound_len(model, len);
         }
+        self.fetch_generation.fetch_add(1, Ordering::SeqCst);
+        *self.fetch_next_allowed_at.lock().await = Instant::now();
+        self.fetch_change_notify.notify_waiters();
+        drop(_gate);
+        drop(_transition);
         self.degrade_notify.notify_one();
         self.status().await
     }
@@ -219,77 +329,194 @@ impl App {
         Ok(effective)
     }
 
-    async fn fetch_once(&self, settings: &Settings, model: &str) -> Result<String> {
-        let effective = self.fetch_settings(settings).map_err(|err| err.to_string());
-        let settings = match effective {
+    async fn wait_for_fetch_slot(&self, generation: u64) -> bool {
+        loop {
+            let notified = self.fetch_change_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.fetch_generation.load(Ordering::SeqCst) != generation {
+                return false;
+            }
+            let wait = {
+                let next = *self.fetch_next_allowed_at.lock().await;
+                next.saturating_duration_since(Instant::now())
+            };
+            if wait.is_zero() {
+                return true;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {},
+                _ = &mut notified => {},
+            }
+        }
+    }
+
+    async fn defer_next_fetch(&self, delay: Duration) {
+        *self.fetch_next_allowed_at.lock().await = Instant::now() + delay;
+    }
+
+    async fn fetch_once(&self, model: &str) -> std::result::Result<String, FetchOnceError> {
+        let _gate = self.fetch_gate.lock().await;
+        let generation = self.fetch_generation.load(Ordering::SeqCst);
+        if generation % 2 == 1 {
+            return Err(FetchOnceError::new(
+                format!("[{model}] 配置切换中，暂不获取票据"),
+                FetchRetryClass::Normal,
+            ));
+        }
+        let saved = self.settings.lock().await.clone();
+        let settings = match self.fetch_settings(&saved) {
             Ok(settings) => settings,
-            Err(message) => {
+            Err(err) => {
+                let message = err.to_string();
+                self.defer_next_fetch(fetch::ERROR_BACKOFF).await;
                 *self.fetch_error.lock().await = Some(message.clone());
-                anyhow::bail!("{message}");
+                return Err(FetchOnceError::new(message, FetchRetryClass::Backoff));
             }
         };
         if !has_chatgpt_login(Path::new(&settings.codex_home)) {
             let message = "尚未登录 ChatGPT".to_string();
+            self.defer_next_fetch(fetch::AUTH_BACKOFF).await;
             *self.fetch_error.lock().await = Some(message.clone());
-            anyhow::bail!("{message}");
+            return Err(FetchOnceError::new(message, FetchRetryClass::Auth));
         }
         let creds = match login::chatgpt_credentials(Path::new(&settings.codex_home)) {
             Ok(creds) => creds,
             Err(err) => {
                 let message = format!("{err:#}");
+                self.defer_next_fetch(fetch::AUTH_BACKOFF).await;
                 *self.fetch_error.lock().await = Some(message.clone());
-                anyhow::bail!("{message}");
+                return Err(FetchOnceError::new(message, FetchRetryClass::Auth));
             }
         };
-        let client = match fetch::http_client(&settings.outbound_proxy) {
-            Ok(client) => client,
-            Err(err) => {
-                let message = format!("{err:#}");
-                *self.fetch_error.lock().await = Some(message.clone());
-                anyhow::bail!("{message}");
-            }
+        let (target_len, allow_auto_quality, account_matches) = {
+            let store = self.turn_state.lock().await;
+            (
+                store.bound_len_for(model),
+                store.allows_auto_quality_discovery(model),
+                store.is_bound_to_account(&creds.account_id),
+            )
         };
-        let started = Instant::now();
-        let mut details = NetworkLogDetails::default();
-        let token =
-            match fetch::fetch_turn_state_with_log(&client, &settings, &creds, model, &mut details)
-                .await
-            {
-                Ok(token) => token,
+        if !account_matches {
+            return Err(FetchOnceError::new(
+                format!("[{model}] 登录账号与票据池绑定账号不一致"),
+                FetchRetryClass::Stale,
+            ));
+        }
+
+        for attempt in 1..=fetch::CONNECT_ATTEMPTS {
+            if !self.wait_for_fetch_slot(generation).await {
+                let message = format!("[{model}] 配置已变化，取消旧线路票据请求");
+                return Err(FetchOnceError::new(message, FetchRetryClass::Stale));
+            }
+            let client = match fetch::http_client(&settings.outbound_proxy) {
+                Ok(client) => client,
                 Err(err) => {
-                    self.record_fetch(started, details).await;
                     let message = format!("{err:#}");
-                    eprintln!("[{}] turn-state fetch failed: {message}", model);
+                    self.defer_next_fetch(fetch::ERROR_BACKOFF).await;
                     *self.fetch_error.lock().await = Some(message.clone());
-                    anyhow::bail!("{message}");
+                    return Err(FetchOnceError::new(message, FetchRetryClass::Backoff));
                 }
             };
-        if turn_state::TurnState::from_token(&token, "fetch").is_none() {
-            details.turn_state_action = "rejected_invalid".into();
-            self.record_fetch(started, details).await;
-            let message = format!("[{}] 上游 token 无法解析", model);
-            *self.fetch_error.lock().await = Some(message.clone());
-            anyhow::bail!("{message}");
-        }
-        if turn_state::is_degraded_token(&token) {
-            details.turn_state_action = "rejected_degraded".into();
-            self.record_fetch(started, details).await;
-            let message = format!(
-                "[{}] 采到 312 token（{}字节），已丢弃，等待重试",
+            let started = Instant::now();
+            let mut details = NetworkLogDetails::default();
+            let result = fetch::fetch_turn_state_with_log(
+                &client,
+                &settings,
+                &creds,
                 model,
-                token.len()
-            );
-            eprintln!("⚠ {message}");
-            *self.fetch_error.lock().await = Some(message.clone());
-            anyhow::bail!("{message}");
+                target_len,
+                allow_auto_quality,
+                &mut details,
+            )
+            .await;
+
+            match result {
+                Ok(token) => {
+                    if self.fetch_generation.load(Ordering::SeqCst) != generation {
+                        details.turn_state_action = "discarded_stale_config".into();
+                        self.record_fetch(started, details).await;
+                        let message = format!("[{model}] 配置已变化，丢弃旧线路返回的票据");
+                        return Err(FetchOnceError::new(message, FetchRetryClass::Stale));
+                    }
+                    let ready = {
+                        let mut store = self.turn_state.lock().await;
+                        if self.fetch_generation.load(Ordering::SeqCst) != generation
+                            || !store.is_bound_to_account(&creds.account_id)
+                        {
+                            None
+                        } else {
+                            store.record_distribution(
+                                model,
+                                vec![turn_state::TokenLenCount {
+                                    len: token.len(),
+                                    count: 1,
+                                }],
+                            );
+                            Some(capture_fetched_ticket(&mut store, model, &token))
+                        }
+                    };
+                    let Some(ready) = ready else {
+                        details.turn_state_action = "discarded_stale_config".into();
+                        self.record_fetch(started, details).await;
+                        let message = format!("[{model}] 配置已变化，丢弃旧线路返回的票据");
+                        return Err(FetchOnceError::new(message, FetchRetryClass::Stale));
+                    };
+                    self.defer_next_fetch(fetch::RETRY_INTERVAL).await;
+                    if !ready {
+                        details.turn_state_action = "pooled_unmatched".into();
+                        self.record_fetch(started, details).await;
+                        let message = format!(
+                            "[{model}] 采到 {} 字节票据，但未匹配请求开始时的目标长度 {target_len}",
+                            token.len()
+                        );
+                        *self.fetch_error.lock().await = Some(message.clone());
+                        return Err(FetchOnceError::new(message, FetchRetryClass::Normal));
+                    }
+                    details.turn_state_action = "captured".into();
+                    self.record_fetch(started, details).await;
+                    *self.fetch_error.lock().await = None;
+                    *self.fetch_ok_at.lock().await = Some(
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    );
+                    return Ok(token);
+                }
+                Err(err) => {
+                    if self.fetch_generation.load(Ordering::SeqCst) != generation {
+                        details.turn_state_action = "discarded_stale_config".into();
+                        self.record_fetch(started, details).await;
+                        let message = format!("[{model}] 配置已变化，忽略旧线路请求错误");
+                        return Err(FetchOnceError::new(message, FetchRetryClass::Stale));
+                    }
+                    let error_kind = details.error_kind.clone();
+                    let retry_class = classify_fetch_failure(&details);
+                    if let Some(len) = details.returned_turn_state_len {
+                        self.turn_state.lock().await.record_distribution(
+                            model,
+                            vec![turn_state::TokenLenCount { len, count: 1 }],
+                        );
+                    }
+                    self.record_fetch(started, details).await;
+                    let message = format!("{err:#}");
+                    eprintln!("[{model}] turn-state fetch failed: {message}");
+                    *self.fetch_error.lock().await = Some(message.clone());
+
+                    let connect = error_kind.as_deref() == Some("connect");
+                    if connect && attempt < fetch::CONNECT_ATTEMPTS {
+                        self.defer_next_fetch(fetch::CONNECT_RETRY_INTERVAL).await;
+                        continue;
+                    }
+                    let final_class = if connect {
+                        FetchRetryClass::Backoff
+                    } else {
+                        retry_class
+                    };
+                    self.defer_next_fetch(fetch_retry_delay(final_class)).await;
+                    return Err(FetchOnceError::new(message, final_class));
+                }
+            }
         }
-        details.turn_state_action = "captured".into();
-        self.record_fetch(started, details).await;
-        self.turn_state.lock().await.capture(model, &token, "fetch");
-        *self.fetch_error.lock().await = None;
-        *self.fetch_ok_at.lock().await =
-            Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-        Ok(token)
+        unreachable!("connect retry loop always returns")
     }
 
     async fn refresh_if_needed(&self) -> Duration {
@@ -338,132 +565,44 @@ impl App {
             return fetch::CHECK_INTERVAL;
         }
 
-        // 逐模型并发获取，每个模型 10 路并发
-        const CONCURRENCY: usize = 10;
-        self.fetch_round
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let round = self.fetch_round.load(std::sync::atomic::Ordering::Relaxed);
+        let round = self.fetch_round.fetch_add(1, Ordering::Relaxed) + 1;
+        let model = model_for_fetch_round(&models_needing_refresh, round)
+            .expect("models_needing_refresh is not empty");
+        let bound_len = self.turn_state.lock().await.bound_len_for(model);
+        *self.fetch_error.lock().await = Some(format!(
+            "正在单发获取 {} 的 {} Token（第 {} 轮）…",
+            model, bound_len, round
+        ));
+        debug_log(&format!(
+            "[{}] 需要新 token，第 {} 轮单发获取，目标长度 {}",
+            model, round, bound_len
+        ));
 
-        let mut all_ok = true;
-
-        for model in &models_needing_refresh {
-            eprintln!(
-                "[{}] 需要新 token，第 {} 轮并发 {} 路获取...",
-                model, round, CONCURRENCY
-            );
-            let bound_label = self.turn_state.lock().await.bound_len();
-            *self.fetch_error.lock().await = Some(format!(
-                "正在获取 {} 的 {} Token（第 {} 轮）…",
-                model, bound_label, round
-            ));
-
-            let bound_len = self.turn_state.lock().await.bound_len_for(model);
-
-            let mut handles = tokio::task::JoinSet::new();
-            for _ in 0..CONCURRENCY {
-                let s = settings.clone();
-                let rotated = s.outbound_proxy.clone();
-                let client = match fetch::http_client(&rotated) {
-                    Ok(c) => c,
-                    Err(_) => continue,
+        match self.fetch_once(model).await {
+            Ok(token) => {
+                debug_log(&format!("✅ [{}] 单发命中 {} 字节票据", model, token.len()));
+                let remaining = {
+                    let store = self.turn_state.lock().await;
+                    store
+                        .all_active_models()
+                        .into_iter()
+                        .any(|active| store.needs_refresh(&active))
                 };
-                let creds = match login::chatgpt_credentials(Path::new(&s.codex_home)) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let m = model.clone();
-                handles.spawn(async move {
-                    let started = Instant::now();
-                    let mut details = NetworkLogDetails::default();
-                    let result =
-                        fetch::fetch_turn_state_with_log(&client, &s, &creds, &m, &mut details)
-                            .await;
-                    (started, result, details)
-                });
-            }
-
-            // 收集所有返回的 token
-            let mut all_tokens: Vec<String> = Vec::new();
-            while let Some(result) = handles.join_next().await {
-                if let Ok((started, result, mut details)) = result {
-                    if let Ok(token) = result {
-                        if turn_state::TurnState::from_token(&token, "fetch").is_some() {
-                            details.turn_state_action = "received".into();
-                            all_tokens.push(token);
-                        } else {
-                            details.turn_state_action = "rejected_invalid".into();
-                        }
-                    }
-                    self.record_fetch(started, details).await;
-                }
-            }
-
-            // 统计 token 长度分布
-            let mut dist_map: std::collections::HashMap<usize, u32> =
-                std::collections::HashMap::new();
-            for token in &all_tokens {
-                *dist_map.entry(token.trim().len()).or_default() += 1;
-            }
-            let mut distribution: Vec<turn_state::TokenLenCount> = dist_map
-                .into_iter()
-                .map(|(len, count)| turn_state::TokenLenCount { len, count })
-                .collect();
-            distribution.sort_by_key(|d| d.len);
-
-            // 记录分布（不持久化，仅内存展示）
-            {
-                let mut store = self.turn_state.lock().await;
-                store.record_distribution(model, distribution.clone());
-            }
-
-            // 日志：展示分布
-            let dist_str: String = distribution
-                .iter()
-                .map(|d| format!("{}×{}", d.len, d.count))
-                .collect::<Vec<_>>()
-                .join(", ");
-            debug_log(&format!(
-                "[{}] 第 {} 轮获取完成，共 {} 个 token，分布: [{}]，绑定长度: {}",
-                model,
-                round,
-                all_tokens.len(),
-                dist_str,
-                bound_len
-            ));
-
-            // 全量入池（所有长度都缓存，方便切换绑定时不用重新获取）
-            {
-                let mut store = self.turn_state.lock().await;
-                let matched = store.capture_batch(model, &all_tokens, "fetch");
-                if matched > 0 {
-                    debug_log(&format!(
-                        "✅ [{}] 全部 {} 个 token 入池，其中 {} 个匹配绑定长度 {}",
-                        model, all_tokens.len(), matched, bound_len
-                    ));
+                if remaining {
+                    fetch::RETRY_INTERVAL
                 } else {
-                    debug_log(&format!(
-                        "⚠ [{}] 全部 {} 个 token 入池，但无匹配绑定长度 {} 的",
-                        model, all_tokens.len(), bound_len
-                    ));
-                    all_ok = false;
+                    fetch::CHECK_INTERVAL
                 }
             }
+            Err(err) => {
+                let message = format!("{err:#}");
+                eprintln!("[{}] 单发未命中: {message}", model);
+                if err.retry != FetchRetryClass::Stale {
+                    *self.fetch_error.lock().await = Some(message.clone());
+                }
+                fetch_retry_delay(err.retry)
+            }
         }
-
-        if all_ok {
-            *self.fetch_error.lock().await = None;
-            *self.fetch_ok_at.lock().await = Some(
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            );
-            fetch::CHECK_INTERVAL
-        } else {
-            Duration::ZERO
-        }
-    }
-
-    pub(crate) fn signal_degradation(&self) {
-        self.degraded.store(true, Ordering::Relaxed);
-        self.degrade_notify.notify_one();
     }
 
     async fn record(
@@ -705,8 +844,14 @@ impl ProxyHandle {
             || old.warp_http2 != next.warp_http2
             || old.upstream != next.upstream
             || old.codex_home != next.codex_home;
+        let mut fetch_transition_guard = None;
+        let mut fetch_change_guard = None;
         if route_changed {
+            fetch_transition_guard = Some(self.app.fetch_transition.lock().await);
+            self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
+            self.app.fetch_change_notify.notify_waiters();
             self.stop_fetch_loop().await;
+            fetch_change_guard = Some(self.app.fetch_gate.lock().await);
             self.app.turn_state.lock().await.invalidate_all();
             *self.app.fetch_error.lock().await = None;
             *self.app.fetch_ok_at.lock().await = None;
@@ -722,6 +867,13 @@ impl ProxyHandle {
             if let Some(http) = next_http {
                 *self.app.http.lock().await = http;
             }
+        }
+        if route_changed {
+            self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
+            *self.app.fetch_next_allowed_at.lock().await = Instant::now();
+            self.app.fetch_change_notify.notify_waiters();
+            drop(fetch_change_guard.take());
+            drop(fetch_transition_guard.take());
         }
         if old.proxy_listen != next.proxy_listen {
             if let Err(err) = self.start().await {
@@ -772,12 +924,23 @@ impl ProxyHandle {
         if settings.outbound_mode != OutboundMode::Warp {
             anyhow::bail!("请先选择内置 WARP 模式");
         }
+        let fetch_transition = self.app.fetch_transition.lock().await;
+        self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
+        self.app.fetch_change_notify.notify_waiters();
         self.stop_fetch_loop().await;
+        let fetch_change = self.app.fetch_gate.lock().await;
         let result = self
             .app
             .warp
             .connect(accept_terms, settings.warp_http2)
             .await;
+        self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
+        *self.app.fetch_next_allowed_at.lock().await = Instant::now();
+        self.app.fetch_change_notify.notify_waiters();
+        *self.app.fetch_error.lock().await = None;
+        *self.app.fetch_ok_at.lock().await = None;
+        drop(fetch_change);
+        drop(fetch_transition);
         self.start_fetch_loop().await;
         result?;
         Ok(self.app.status().await)
@@ -785,8 +948,19 @@ impl ProxyHandle {
 
     pub async fn stop_warp(&self) -> Status {
         let _change = self.settings_change.lock().await;
+        let fetch_transition = self.app.fetch_transition.lock().await;
+        self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
+        self.app.fetch_change_notify.notify_waiters();
         self.stop_fetch_loop().await;
+        let fetch_change = self.app.fetch_gate.lock().await;
         self.app.warp.stop().await;
+        self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
+        *self.app.fetch_next_allowed_at.lock().await = Instant::now();
+        self.app.fetch_change_notify.notify_waiters();
+        *self.app.fetch_error.lock().await = None;
+        *self.app.fetch_ok_at.lock().await = None;
+        drop(fetch_change);
+        drop(fetch_transition);
         self.start_fetch_loop().await;
         self.app.status().await
     }
@@ -1106,6 +1280,15 @@ mod upstream_proxy_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+
+    fn ticket_for_len(target_len: usize) -> String {
+        let mut raw = vec![0_u8; target_len * 3 / 4];
+        raw[0] = 0x80;
+        raw[1..9].copy_from_slice(&(chrono::Utc::now().timestamp() as u64).to_be_bytes());
+        URL_SAFE_NO_PAD.encode(raw)
+    }
 
     #[test]
     fn warp_route_never_falls_back_to_saved_manual_proxy() {
@@ -1136,5 +1319,100 @@ mod tests {
         let uri: Uri = "http://127.0.0.1:8787/v1/responses".parse().unwrap();
         let out = join_upstream("https://chatgpt.com/backend-api/codex/", &uri).unwrap();
         assert_eq!(out, "https://chatgpt.com/backend-api/codex/v1/responses");
+    }
+
+    #[test]
+    fn fetch_round_rotates_models_without_starvation() {
+        let models = vec!["astra".to_string(), "sol".to_string(), "other".to_string()];
+        let selected: Vec<_> = (1..=5)
+            .map(|round| model_for_fetch_round(&models, round).unwrap())
+            .collect();
+        assert_eq!(selected, vec!["astra", "sol", "other", "astra", "sol"]);
+        assert_eq!(model_for_fetch_round(&[], 1), None);
+    }
+
+    #[test]
+    fn fetch_errors_never_retry_without_delay() {
+        assert_eq!(fetch_retry_delay(FetchRetryClass::Normal), fetch::RETRY_INTERVAL);
+        assert_eq!(fetch_retry_delay(FetchRetryClass::Backoff), fetch::ERROR_BACKOFF);
+        assert_eq!(fetch_retry_delay(FetchRetryClass::Auth), fetch::AUTH_BACKOFF);
+        assert_eq!(fetch_retry_delay(FetchRetryClass::Stale), fetch::RETRY_INTERVAL);
+        assert!(fetch::RETRY_INTERVAL >= Duration::from_secs(6));
+        assert_eq!(fetch::CONNECT_ATTEMPTS, 4);
+        assert!(fetch::CONNECT_RETRY_INTERVAL >= Duration::from_secs(6));
+    }
+
+    #[test]
+    fn fetch_failure_class_uses_structured_status_and_error_kind() {
+        for status in [401, 403] {
+            let details = NetworkLogDetails {
+                response_status: Some(status),
+                ..NetworkLogDetails::default()
+            };
+            assert_eq!(classify_fetch_failure(&details), FetchRetryClass::Auth);
+        }
+        for status in [429, 503] {
+            let details = NetworkLogDetails {
+                response_status: Some(status),
+                ..NetworkLogDetails::default()
+            };
+            assert_eq!(classify_fetch_failure(&details), FetchRetryClass::Backoff);
+        }
+        let connect = NetworkLogDetails {
+            error_kind: Some("connect".into()),
+            ..NetworkLogDetails::default()
+        };
+        assert_eq!(classify_fetch_failure(&connect), FetchRetryClass::Backoff);
+        assert_eq!(
+            classify_fetch_failure(&NetworkLogDetails::default()),
+            FetchRetryClass::Normal
+        );
+    }
+
+    #[test]
+    fn fetched_ticket_must_match_the_models_exact_bound_length() {
+        let mut store = TurnStateStore::default();
+        store.set_model_bound_len("astra", Some(turn_state::QUALITY_TOKEN_LEN));
+        let original_292 = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
+        assert!(capture_fetched_ticket(&mut store, "astra", &original_292));
+        let token_332 = ticket_for_len(turn_state::QUALITY_TOKEN_LEN_332);
+        assert!(!capture_fetched_ticket(&mut store, "astra", &token_332));
+        assert_eq!(
+            store.peek_for_model("astra").as_deref(),
+            Some(original_292.as_str())
+        );
+
+        let token_292 = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
+        assert!(capture_fetched_ticket(&mut store, "astra", &token_292));
+        assert_eq!(store.peek_for_model("astra").as_deref(), Some(token_292.as_str()));
+
+        let mut auto = TurnStateStore::default();
+        assert!(capture_fetched_ticket(&mut auto, "astra", &token_332));
+        assert_eq!(auto.bound_len_for("astra"), turn_state::QUALITY_TOKEN_LEN_332);
+    }
+
+    #[tokio::test]
+    async fn shared_fetch_slot_enforces_the_configured_delay() {
+        let app = App::new(Settings::default()).unwrap();
+        app.defer_next_fetch(Duration::from_millis(30)).await;
+        let started = Instant::now();
+        let generation = app.fetch_generation.load(Ordering::SeqCst);
+        assert!(app.wait_for_fetch_slot(generation).await);
+        assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn generation_change_interrupts_a_waiting_fetch_slot() {
+        let app = Arc::new(App::new(Settings::default()).unwrap());
+        app.defer_next_fetch(Duration::from_secs(5)).await;
+        let generation = app.fetch_generation.load(Ordering::SeqCst);
+        let waiter = {
+            let app = app.clone();
+            tokio::spawn(async move { app.wait_for_fetch_slot(generation).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        app.fetch_generation.fetch_add(2, Ordering::SeqCst);
+        app.fetch_change_notify.notify_waiters();
+        assert!(!waiter.await.unwrap());
     }
 }

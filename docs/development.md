@@ -87,7 +87,7 @@ target/release/bundle/msi/
 | --- | --- |
 | `frontend/src/` | React 界面、样式与模拟接口 |
 | `src-tauri/src/` | 桌面生命周期、IPC 命令与登录会话 |
-| `src/proxy.rs` | HTTP/WebSocket 转发、获取调度与自动接入管理 |
+| `src/proxy.rs` | HTTP SSE 转发、获取调度与自动接入管理；WebSocket 返回 426 触发客户端回退 |
 | `src/attach.rs` | Codex 配置修改、备份与恢复 |
 | `src/login.rs`、`src/browser_login.rs` | 授权码登录、回调登录与凭据保存 |
 | `src/fetch.rs`、`src/turn_state.rs` | Turn-State 获取、缓存与替换 |

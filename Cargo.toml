@@ -1,9 +1,9 @@
 [package]
 name = "codex-state-kit"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 rust-version = "1.85"
-description = "Transparent local reverse proxy for Codex HTTP and WebSocket"
+description = "Transparent local reverse proxy for Codex HTTP SSE"
 exclude = ["frontend", "dist", "node_modules"]
 
 [lib]
@@ -33,6 +33,7 @@ toml_edit = "0.22"
 base64 = "0.22"
 url = "2"
 rand = "0.9"
+uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 flate2 = "1"
 zstd = "0.13"
