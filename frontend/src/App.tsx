@@ -27,7 +27,9 @@ function chipClass(status: Status) {
 
 function tokenChip(view?: TurnStateView | null) {
   if (!view || view.status === "empty") return { label: "等待 Token", className: "runtime-chip runtime-chip--idle" };
+  if (view.status === "idle") return { label: "等待请求", className: "runtime-chip runtime-chip--idle" };
   if (view.status === "active") return { label: "Token 可用", className: "runtime-chip" };
+  if (view.status === "partial") return { label: "部分可用", className: "runtime-chip runtime-chip--warm" };
   return { label: "Token 已过期", className: "runtime-chip runtime-chip--warm" };
 }
 
@@ -44,8 +46,16 @@ function formatAge(secs?: number | null) {
   return `${Math.floor(secs / 3600)} 小时前`;
 }
 
+function modelSummary(view?: TurnStateView | null): string {
+  const models = view?.models;
+  if (!models || models.length === 0) return "";
+  const active = models.filter((m) => m.status === "active").length;
+  const bound = view?.boundTokenLen ?? 292;
+  return `${active}/${models.length} 个模型 Token 就绪 · 绑定 ${bound}`;
+}
+
 function tokenCopy(view?: TurnStateView | null, fetchError?: string | null) {
-  if (fetchError && (!view || view.status !== "active")) {
+  if (fetchError && (!view || (view.status !== "active" && view.status !== "idle"))) {
     return {
       title: "正在获取 292 Token…",
       body: fetchError,
@@ -59,16 +69,33 @@ function tokenCopy(view?: TurnStateView | null, fetchError?: string | null) {
       loading: false,
     };
   }
-  if (view.status === "active") {
+  if (view.status === "idle") {
     return {
-      title: "292 Token 正在复用",
-      body: "",
+      title: "等待发现模型",
+      body: "Codex 发起第一个请求后，自动识别模型并预取 Token。",
       loading: false,
+    };
+  }
+  if (view.status === "active") {
+    const summary = modelSummary(view);
+    const bound = view.boundTokenLen ?? 292;
+    return {
+      title: `${bound} Token 正在复用`,
+      body: summary,
+      loading: false,
+    };
+  }
+  if (view.status === "partial") {
+    const summary = modelSummary(view);
+    return {
+      title: "部分模型 Token 已就绪",
+      body: summary || "其余模型正在获取中…",
+      loading: true,
     };
   }
   return {
     title: "等待刷新 Token",
-    body: "Token 已超过约 30 分钟，等待 StateKit 通过出站代理重新获取。",
+    body: "Token 已超过 35 分钟，正在通过出站代理预取新 Token。",
     loading: true,
   };
 }
@@ -193,7 +220,72 @@ export default function App() {
               {meta ? <p className="token-card__meta">{meta}</p> : null}
             </div>
           </div>
-          <span className="token-card__badge"><Radio size={14} /> {fwd.status.proxyOk ? "后台自动管理" : "等待代理启动"}</span>
+          <span className="token-card__badge"><Radio size={14} /> {fwd.status.proxyOk ? `自动管理 · 绑定 ${turn?.boundTokenLen ?? 292}` : "等待代理启动"}</span>
+          {turn?.models && turn.models.length > 0 ? (
+            <div className="token-models">
+              {turn.models.map((m) => {
+                const effectiveBound = m.boundOverride ?? turn.boundTokenLen ?? 292;
+                const hasOverride = m.boundOverride != null;
+                return (
+                <div key={m.model} className="token-model-row">
+                  <span className={`token-model token-model--${m.status}`}>
+                    <i />{m.model}{m.ageSecs != null ? ` · ${formatAge(m.ageSecs)}` : ""}{m.len ? ` · ${m.len}字节` : ""}
+                    {hasOverride ? <span className="token-model__override">独立绑定 {effectiveBound}</span> : null}
+                  </span>
+                  {/* 池中缓存的 token（所有长度），点击设置模型级绑定 */}
+                  {m.poolTokens && m.poolTokens.length > 0 ? (
+                    <span className="token-pool">
+                      {m.poolTokens.map((p) => (
+                        <button
+                          key={p.len}
+                          type="button"
+                          className={`token-pool__chip${p.isBound ? " token-pool__chip--bound" : ""}${!p.isValid ? " token-pool__chip--expired" : ""}`}
+                          title={
+                            p.isBound
+                              ? `当前${hasOverride ? "独立" : "全局"}绑定 · ${p.len}字节 · ${formatAge(p.ageSecs)}`
+                              : `点击为 ${m.model} 独立绑定 ${p.len}`
+                          }
+                          onClick={() => {
+                            if (p.isBound && hasOverride) {
+                              void fwd.bindModelTokenLen(m.model, null);
+                            } else {
+                              void fwd.bindModelTokenLen(m.model, p.len);
+                            }
+                          }}
+                        >
+                          <span className="token-pool__len">{p.len}</span>
+                          <span className="token-pool__age">{formatAge(p.ageSecs)}</span>
+                          {p.isBound ? <span className="token-pool__bound-tag">{hasOverride ? "独立" : "全局"}</span> : null}
+                        </button>
+                      ))}
+                      {hasOverride ? (
+                        <button
+                          type="button"
+                          className="token-pool__chip token-pool__chip--reset"
+                          title="清除模型级绑定，恢复跟随全局"
+                          onClick={() => void fwd.bindModelTokenLen(m.model, null)}
+                        >
+                          ↩ 跟随全局
+                        </button>
+                      ) : null}
+                    </span>
+                  ) : null}
+                  {/* 最近一轮 fetch 的分布统计 */}
+                  {m.distribution && m.distribution.length > 0 ? (
+                    <span className="token-dist">
+                      <span className="token-dist__label">分布:</span>
+                      {m.distribution.map((d) => (
+                        <span key={d.len} className="token-dist__item">
+                          {d.len}×{d.count}
+                        </span>
+                      ))}
+                    </span>
+                  ) : null}
+                </div>
+                );
+              })}
+            </div>
+          ) : null}
           {fwd.status.fetchError && turn?.status === "active" ? (
             <p className="token-card__meta token-card__meta--warn">刷新失败：{fwd.status.fetchError}</p>
           ) : null}

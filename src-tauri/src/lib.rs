@@ -49,6 +49,8 @@ pub fn run() {
             commands::poll_chatgpt_login,
             commands::cancel_chatgpt_login,
             commands::open_url,
+            commands::set_bound_token_len,
+            commands::set_model_bound_token_len,
             commands::connect_warp,
             commands::stop_warp,
             commands::open_warp_terms,

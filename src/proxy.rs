@@ -1,11 +1,8 @@
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{FromRequest, State, WebSocketUpgrade};
+use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use futures_util::{SinkExt, StreamExt};
-use http::header::SEC_WEBSOCKET_PROTOCOL;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -14,11 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex, Notify};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::tungstenite;
-use tokio_tungstenite::MaybeTlsStream;
 use url::Url;
 
 use crate::attach::{self, is_attached};
@@ -28,6 +22,24 @@ use crate::logs::{self, LogEntry};
 use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch};
 use crate::turn_state::{self, TurnStateStore, TurnStateView};
 use crate::warp::{WarpRuntime, WarpStatus};
+
+fn debug_log(msg: &str) {
+    eprintln!("{}", msg);
+    let path = crate::settings::home_dir().join(if cfg!(debug_assertions) {
+        ".codex-state-kit-dev-debug.log"
+    } else {
+        ".codex-state-kit-debug.log"
+    });
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let ts = chrono::Local::now().format("%H:%M:%S%.3f");
+        let _ = writeln!(f, "[{}] {}", ts, msg);
+    }
+}
 
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -81,6 +93,10 @@ pub struct App {
     degraded_at: Mutex<Option<String>>,
     pub degrade_notify: Notify,
     pub warp_wake: Notify,
+    /// 新模型被发现时通知 fetch 循环立即唤醒
+    model_notify: Notify,
+    /// 是否已注册 settings.models 中的种子模型
+    seeds_registered: AtomicBool,
 }
 
 impl App {
@@ -108,6 +124,8 @@ impl App {
             degraded_at: Mutex::new(None),
             degrade_notify: Notify::new(),
             warp_wake: Notify::new(),
+            model_notify: Notify::new(),
+            seeds_registered: AtomicBool::new(false),
         })
     }
 
@@ -141,8 +159,38 @@ impl App {
 
     pub async fn refresh_turn_state(&self) -> Result<Status> {
         let settings = self.settings.lock().await.clone();
-        self.fetch_once(&settings).await?;
+        let mut last_error: Option<anyhow::Error> = None;
+        for model in &settings.models {
+            if let Err(e) = self.fetch_once(&settings, model).await {
+                eprintln!("[refresh] 模型 {} 获取失败: {e:#}", model);
+                last_error = Some(e);
+            }
+        }
+        if let Some(e) = last_error {
+            if settings.models.len() == 1 {
+                return Err(e);
+            }
+        }
         Ok(self.status().await)
+    }
+
+    /// 用户切换绑定的 token 长度（传 None 恢复默认 292）
+    pub async fn set_bound_token_len(&self, len: Option<usize>) -> Status {
+        {
+            let mut store = self.turn_state.lock().await;
+            store.set_bound_len(len);
+        }
+        self.degrade_notify.notify_one();
+        self.status().await
+    }
+
+    pub async fn set_model_bound_token_len(&self, model: &str, len: Option<usize>) -> Status {
+        {
+            let mut store = self.turn_state.lock().await;
+            store.set_model_bound_len(model, len);
+        }
+        self.degrade_notify.notify_one();
+        self.status().await
     }
 
     fn fetch_settings(&self, settings: &Settings) -> Result<Settings> {
@@ -156,7 +204,7 @@ impl App {
         Ok(effective)
     }
 
-    async fn fetch_once(&self, settings: &Settings) -> Result<String> {
+    async fn fetch_once(&self, settings: &Settings, model: &str) -> Result<String> {
         let effective = self.fetch_settings(settings).map_err(|err| err.to_string());
         let settings = match effective {
             Ok(settings) => settings,
@@ -186,28 +234,27 @@ impl App {
                 anyhow::bail!("{message}");
             }
         };
-        let token = match fetch::fetch_turn_state(&client, &settings, &creds).await {
+        let token = match fetch::fetch_turn_state(&client, &settings, &creds, model).await {
             Ok(token) => token,
             Err(err) => {
                 let message = format!("{err:#}");
-                eprintln!("turn-state fetch failed: {message}");
+                eprintln!("[{}] turn-state fetch failed: {message}", model);
                 *self.fetch_error.lock().await = Some(message.clone());
                 anyhow::bail!("{message}");
             }
         };
         if turn_state::TurnState::from_token(&token, "fetch").is_none() {
-            let message = "上游 token 无法解析".to_string();
+            let message = format!("[{}] 上游 token 无法解析", model);
             *self.fetch_error.lock().await = Some(message.clone());
             anyhow::bail!("{message}");
         }
-        // 312 长度 token 是降智 token，不入池，视为采集失败
         if turn_state::is_degraded_token(&token) {
-            let message = format!("采到 312 token（{}字节），已丢弃，等待重试", token.len());
+            let message = format!("[{}] 采到 312 token（{}字节），已丢弃，等待重试", model, token.len());
             eprintln!("⚠ {message}");
             *self.fetch_error.lock().await = Some(message.clone());
             anyhow::bail!("{message}");
         }
-        self.turn_state.lock().await.capture(&token, "fetch");
+        self.turn_state.lock().await.capture(model, &token, "fetch");
         *self.fetch_error.lock().await = None;
         *self.fetch_ok_at.lock().await =
             Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
@@ -228,66 +275,143 @@ impl App {
             return Duration::from_secs(30);
         }
 
-        // 312 降智信号 → 清池
-        if self.degraded.swap(false, Ordering::Relaxed) {
-            eprintln!("312 降智 / 服务端拒绝信号，清池重打 292");
-            self.turn_state.lock().await.invalidate_all();
-            *self.degraded_at.lock().await = None;
-        }
-
-        // 有可用 292 token → 什么都不做，一直用到服务端拒绝
-        if self.turn_state.lock().await.peek_freshest().is_some() {
-            return fetch::CHECK_INTERVAL;
-        }
-
-        // 没有可用 292 token → 并发打，拿到即停
-        const CONCURRENCY: usize = 10;
-
-        self.fetch_round
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let round = self.fetch_round.load(std::sync::atomic::Ordering::Relaxed);
-        eprintln!("池中无 292 token，第 {} 轮并发 {} 路打...", round, CONCURRENCY);
-        *self.fetch_error.lock().await =
-            Some(format!("正在获取 292 Token（第 {} 轮，{} 路并发）…", round, CONCURRENCY));
-
-        let mut handles = tokio::task::JoinSet::new();
-        for _ in 0..CONCURRENCY {
-            let s = settings.clone();
-            let rotated = s.outbound_proxy.clone();
-            let client = match fetch::http_client(&rotated) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let creds = match login::chatgpt_credentials(Path::new(&s.codex_home)) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            handles.spawn(async move { fetch::fetch_turn_state(&client, &s, &creds).await });
-        }
-
-        let mut got_292 = false;
-        while let Some(result) = handles.join_next().await {
-            if let Ok(Ok(token)) = result {
-                if !turn_state::is_degraded_token(&token) {
-                    if turn_state::TurnState::from_token(&token, "fetch").is_some() {
-                        self.turn_state.lock().await.capture(&token, "fetch");
-                        *self.fetch_error.lock().await = None;
-                        *self.fetch_ok_at.lock().await = Some(
-                            chrono::Utc::now()
-                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        );
-                        eprintln!("✅ 拿到 292 token（{}字节），复用中", token.len());
-                        got_292 = true;
-                        handles.abort_all();
-                        break;
-                    }
-                } else {
-                    eprintln!("⚠ 并发拿到 312 token（{}字节），丢弃", token.len());
+        // 首次运行：注册 settings.models 中的种子模型
+        if !self.seeds_registered.swap(true, Ordering::Relaxed) {
+            let mut store = self.turn_state.lock().await;
+            for model in &settings.models {
+                if !model.is_empty() && store.register_model(model) {
+                    eprintln!("[seed] 从设置注册种子模型: {}", model);
                 }
             }
         }
 
-        if got_292 {
+        // 312 降智信号 → 清池（所有模型的 token，但保留追踪）
+        if self.degraded.swap(false, Ordering::Relaxed) {
+            eprintln!("312 降智 / 服务端拒绝信号，清池重打 292（所有模型）");
+            self.turn_state.lock().await.invalidate_all();
+            *self.degraded_at.lock().await = None;
+        }
+
+        // 获取所有活跃模型（最近 60 分钟内有请求的），检查哪些需要刷新
+        let models_needing_refresh: Vec<String> = {
+            let store = self.turn_state.lock().await;
+            store
+                .all_active_models()
+                .into_iter()
+                .filter(|m| store.needs_refresh(m))
+                .collect()
+        };
+
+        if models_needing_refresh.is_empty() {
+            return fetch::CHECK_INTERVAL;
+        }
+
+        // 逐模型并发获取，每个模型 10 路并发
+        const CONCURRENCY: usize = 10;
+        self.fetch_round
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let round = self.fetch_round.load(std::sync::atomic::Ordering::Relaxed);
+
+        let mut all_ok = true;
+
+        for model in &models_needing_refresh {
+            eprintln!(
+                "[{}] 需要新 token，第 {} 轮并发 {} 路获取...",
+                model, round, CONCURRENCY
+            );
+            let bound_label = self.turn_state.lock().await.bound_len();
+            *self.fetch_error.lock().await = Some(format!(
+                "正在获取 {} 的 {} Token（第 {} 轮）…",
+                model, bound_label, round
+            ));
+
+            let bound_len = self.turn_state.lock().await.bound_len_for(model);
+
+            let mut handles = tokio::task::JoinSet::new();
+            for _ in 0..CONCURRENCY {
+                let s = settings.clone();
+                let rotated = s.outbound_proxy.clone();
+                let client = match fetch::http_client(&rotated) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let creds = match login::chatgpt_credentials(Path::new(&s.codex_home)) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let m = model.clone();
+                handles.spawn(async move {
+                    fetch::fetch_turn_state(&client, &s, &creds, &m).await
+                });
+            }
+
+            // 收集所有返回的 token
+            let mut all_tokens: Vec<String> = Vec::new();
+            while let Some(result) = handles.join_next().await {
+                if let Ok(Ok(token)) = result {
+                    if turn_state::TurnState::from_token(&token, "fetch").is_some() {
+                        all_tokens.push(token);
+                    }
+                }
+            }
+
+            // 统计 token 长度分布
+            let mut dist_map: std::collections::HashMap<usize, u32> =
+                std::collections::HashMap::new();
+            for token in &all_tokens {
+                *dist_map.entry(token.trim().len()).or_default() += 1;
+            }
+            let mut distribution: Vec<turn_state::TokenLenCount> = dist_map
+                .into_iter()
+                .map(|(len, count)| turn_state::TokenLenCount { len, count })
+                .collect();
+            distribution.sort_by_key(|d| d.len);
+
+            // 记录分布（不持久化，仅内存展示）
+            {
+                let mut store = self.turn_state.lock().await;
+                store.record_distribution(model, distribution.clone());
+            }
+
+            // 日志：展示分布
+            let dist_str: String = distribution
+                .iter()
+                .map(|d| format!("{}×{}", d.len, d.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            debug_log(&format!(
+                "[{}] 第 {} 轮获取完成，共 {} 个 token，分布: [{}]，绑定长度: {}",
+                model,
+                round,
+                all_tokens.len(),
+                dist_str,
+                bound_len
+            ));
+
+            // 全量入池（所有长度都缓存，方便切换绑定时不用重新获取）
+            {
+                let mut store = self.turn_state.lock().await;
+                let matched = store.capture_batch(model, &all_tokens, "fetch");
+                if matched > 0 {
+                    debug_log(&format!(
+                        "✅ [{}] 全部 {} 个 token 入池，其中 {} 个匹配绑定长度 {}",
+                        model, all_tokens.len(), matched, bound_len
+                    ));
+                } else {
+                    debug_log(&format!(
+                        "⚠ [{}] 全部 {} 个 token 入池，但无匹配绑定长度 {} 的",
+                        model, all_tokens.len(), bound_len
+                    ));
+                    all_ok = false;
+                }
+            }
+        }
+
+        if all_ok {
+            *self.fetch_error.lock().await = None;
+            *self.fetch_ok_at.lock().await = Some(
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            );
             fetch::CHECK_INTERVAL
         } else {
             Duration::ZERO
@@ -360,6 +484,10 @@ impl ProxyHandle {
         let mut status = self.app.status().await;
         status.attach_error = self.attach_error.lock().expect("attach error").clone();
         status
+    }
+
+    pub fn core(&self) -> &App {
+        &self.app
     }
 
     pub async fn run_attachment_supervisor(&self) {
@@ -443,6 +571,9 @@ impl ProxyHandle {
                     _ = tokio::time::sleep(wait) => {}
                     _ = app.degrade_notify.notified() => {
                         eprintln!("312 信号唤醒 fetch 循环，立即续期");
+                    }
+                    _ = app.model_notify.notified() => {
+                        eprintln!("新模型发现，唤醒 fetch 循环");
                     }
                 }
             }
@@ -614,7 +745,12 @@ async fn bind_listen(addr: SocketAddr) -> Result<TcpListener> {
 
 async fn proxy(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
     if is_websocket(&req) {
-        return proxy_ws(app, req).await;
+        // WebSocket 升级需要 Cloudflare cookie（由 Codex 客户端维护），
+        // 代理自建的连接没有 cookie 会被 Cloudflare 403 拒绝。
+        // 返回 426 Upgrade Required —— 官方 Codex 客户端检测到此状态码后
+        // 会自动永久切换到 HTTP SSE 流式传输（见 client.rs FallbackToHttp 逻辑）。
+        eprintln!("[ws] 拒绝 WS 升级（无 Cloudflare cookie），返回 426 触发客户端回退到 HTTP SSE");
+        return (StatusCode::UPGRADE_REQUIRED, "WebSocket not supported by proxy, use HTTP SSE").into_response();
     }
     proxy_http(app, req).await
 }
@@ -653,39 +789,75 @@ async fn forward_http(app: &App, req: Request<Body>) -> Result<Response> {
     let (mut parts, body) = req.into_parts();
     let target = join_upstream(&upstream, &parts.uri)?;
     let path = parts.uri.path();
+
+    // 先读取 body，以便从中提取 model 字段
+    let bytes = axum::body::to_bytes(body, 32 * 1024 * 1024)
+        .await
+        .context("read body")?;
+
+    let should_stamp = turn_state::should_stamp_http(parts.method.as_str(), path);
+    let content_encoding = parts
+        .headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("none");
+    debug_log(&format!(
+        "[proxy] {} {} body={}bytes encoding={} should_stamp={}",
+        parts.method, path, bytes.len(), content_encoding, should_stamp
+    ));
+
     let mut injected_token: Option<String> = None;
-    if turn_state::should_stamp_http(parts.method.as_str(), path) {
-        // 官方协议：第一次请求不带 turn_state，服务端在响应中下发。
-        // 只有客户端已携带 turn_state（同一 turn 的后续请求/重试）时，
-        // 才用我们预取的 292 token 替换，确保 sticky routing 正常。
+    if should_stamp {
+        let request_model = turn_state::extract_model_from_body(&bytes);
+        if request_model.is_none() {
+            debug_log(&format!(
+                "[proxy] 未能解析 model，body 前 300 字节: {:?}",
+                String::from_utf8_lossy(&bytes[..bytes.len().min(300)])
+            ));
+        }
+
+        // 被动发现：从请求中提取模型，自动注册到 token 池
+        if let Some(ref model) = request_model {
+            let is_new = app.turn_state.lock().await.register_model(model);
+            if is_new {
+                debug_log(&format!("[discover] 发现新模型: {}，通知 fetch 循环预取 token", model));
+                app.model_notify.notify_one();
+            }
+        }
+
         let client_already_has = turn_state::has_http_turn_state(&parts.headers);
         if client_already_has {
             let store = app.turn_state.lock().await;
-            if let Some(token) = store.peek_freshest() {
+            // 严格按模型取 token — 不同模型的 token 不可混用
+            let token = if let Some(ref model) = request_model {
+                store.peek_for_model(model)
+            } else {
+                // 无法识别模型时不注入，保留客户端原 token
+                None
+            };
+            if let Some(token) = token {
                 turn_state::apply_http_header(&mut parts.headers, &token);
                 eprintln!(
-                    "[stamp] 替换 turn_state → 292 token len={} 到 {} {}",
+                    "[stamp] 替换 turn_state → token len={} model={:?} 到 {} {}",
                     token.len(),
+                    request_model,
                     parts.method,
                     path
                 );
                 injected_token = Some(token);
             } else {
                 eprintln!(
-                    "[stamp] 客户端携带 turn_state 但无可用 292 token，保留原值 {} {}",
-                    parts.method, path
+                    "[stamp] 无可用 token（model={:?}），保留客户端原值 {} {}",
+                    request_model, parts.method, path
                 );
             }
         } else {
             eprintln!(
-                "[stamp] 首次请求，不注入 turn_state（等服务端下发） {} {}",
-                parts.method, path
+                "[stamp] 首次请求，不注入 turn_state（等服务端下发） {} {} model={:?}",
+                parts.method, path, request_model
             );
         }
     }
-    let bytes = axum::body::to_bytes(body, 32 * 1024 * 1024)
-        .await
-        .context("read body")?;
     let mut builder = app
         .http
         .request(
@@ -745,244 +917,9 @@ async fn forward_http(app: &App, req: Request<Body>) -> Result<Response> {
     Ok(response)
 }
 
-async fn proxy_ws(app: Arc<App>, req: Request<Body>) -> Response {
-    let started = Instant::now();
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| req.uri().path().to_string());
-    let upstream = app.settings.lock().await.upstream.clone();
-    let target = match join_upstream(&upstream, req.uri()) {
-        Ok(url) => to_ws_url(&url),
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let headers = req.headers().clone();
-    let upgrade = match WebSocketUpgrade::from_request(req, &()).await {
-        Ok(ws) => ws,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
-    app.record("WS", &path, 101, started).await;
-    let ws_app = app.clone();
-    upgrade
-        .on_upgrade(move |socket| async move {
-            if let Err(err) = pump_ws(ws_app, socket, target, headers).await {
-                eprintln!("ws proxy: {err}");
-            }
-        })
-        .into_response()
-}
-
-async fn pump_ws(
-    app: Arc<App>,
-    mut client: WebSocket,
-    target: String,
-    headers: HeaderMap,
-) -> Result<()> {
-    eprintln!("[ws] 连接上游 {}", target);
-    let mut request = http::Request::builder().uri(&target).body(())?;
-    for (name, value) in &headers {
-        if name == header::HOST
-            || name == header::CONNECTION
-            || name == header::UPGRADE
-            || name == header::SEC_WEBSOCKET_KEY
-            || name == header::SEC_WEBSOCKET_VERSION
-            || name == header::SEC_WEBSOCKET_EXTENSIONS
-            || name.as_str().eq_ignore_ascii_case("content-length")
-        {
-            continue;
-        }
-        request.headers_mut().insert(name.clone(), value.clone());
-    }
-    if let Some(proto) = headers.get(SEC_WEBSOCKET_PROTOCOL) {
-        request
-            .headers_mut()
-            .insert(SEC_WEBSOCKET_PROTOCOL, proto.clone());
-    }
-    turn_state::clear_http_header(request.headers_mut());
-    let (upstream, _) = match tokio_tungstenite::connect_async(request).await {
-        Ok(pair) => pair,
-        Err(err) => {
-            eprintln!("[ws] 上游连接失败: {err}");
-            let _ = client
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: axum::extract::ws::CloseCode::from(1011u16),
-                    reason: format!("upstream connect failed: {err}").into(),
-                })))
-                .await;
-            anyhow::bail!("connect upstream websocket: {err}");
-        }
-    };
-    eprintln!("[ws] 上游已连接，开始桥接");
-    let result = bridge(app, &mut client, upstream).await;
-    match &result {
-        Err(err) => eprintln!("[ws] 桥接结束(错误): {err}"),
-        Ok(_) => eprintln!("[ws] 桥接正常结束"),
-    }
-    // Close 帧已在 bridge 内部各退出路径发送，无需再发
-    result
-}
-
-/// 双向桥接：client ↔ upstream
-/// 用 CancellationToken 协调两方向，确保先发 Close 帧再退出，避免 10054。
-async fn bridge(
-    app: Arc<App>,
-    client: &mut WebSocket,
-    upstream: tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>,
-) -> Result<()> {
-    let (mut client_tx, mut client_rx) = client.split();
-    let (mut up_tx, mut up_rx) = upstream.split();
-
-    let app_up = app.clone();
-    let app_down = app;
-
-    // 共享的取消标志
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let cancel_up = cancel.clone();
-    let cancel_down = cancel.clone();
-
-    // client → upstream
-    let to_up = async {
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel_up.cancelled() => {
-                    eprintln!("[ws] client→upstream 收到停止信号，发 Close 给上游");
-                    let _ = up_tx.send(tungstenite::Message::Close(None)).await;
-                    break;
-                }
-                msg = client_rx.next() => {
-                    let Some(msg) = msg else { break };
-                    let msg = match msg {
-                        Ok(m) => m,
-                        Err(err) => {
-                            eprintln!("[ws←client] 读取错误: {err}");
-                            break;
-                        }
-                    };
-                    match msg {
-                        Message::Text(t) => {
-                            let text = maybe_stamp_ws(&app_up, t.to_string()).await;
-                            if let Err(err) = up_tx.send(tungstenite::Message::Text(text.into())).await {
-                                eprintln!("[ws→upstream] 发送错误: {err}");
-                                break;
-                            }
-                        }
-                        Message::Binary(b) => {
-                            if let Err(err) = up_tx.send(tungstenite::Message::Binary(b)).await {
-                                eprintln!("[ws→upstream] 发送错误: {err}");
-                                break;
-                            }
-                        }
-                        Message::Ping(p) => { let _ = up_tx.send(tungstenite::Message::Ping(p)).await; }
-                        Message::Pong(p) => { let _ = up_tx.send(tungstenite::Message::Pong(p)).await; }
-                        Message::Close(c) => {
-                            let frame = c.map(|f| tungstenite::protocol::CloseFrame {
-                                code: tungstenite::protocol::frame::coding::CloseCode::from(u16::from(f.code)),
-                                reason: f.reason.to_string().into(),
-                            });
-                            let _ = up_tx.send(tungstenite::Message::Close(frame)).await;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        cancel.cancel();
-    };
-
-    // upstream → client
-    let to_client = async {
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel_down.cancelled() => {
-                    eprintln!("[ws] upstream→client 收到停止信号，发 Close 给客户端");
-                    let _ = client_tx.send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                        code: axum::extract::ws::CloseCode::from(1000u16),
-                        reason: "peer finished".into(),
-                    }))).await;
-                    break;
-                }
-                msg = up_rx.next() => {
-                    let Some(msg) = msg else {
-                        eprintln!("[ws] 上游流结束（EOF），发 Close 给客户端");
-                        let _ = client_tx.send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                            code: axum::extract::ws::CloseCode::from(1000u16),
-                            reason: "upstream closed".into(),
-                        }))).await;
-                        break;
-                    };
-                    let msg = match msg {
-                        Ok(m) => m,
-                        Err(err) => {
-                            eprintln!("[ws←upstream] 读取错误: {err}，发 Close 给客户端");
-                            let _ = client_tx.send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                                code: axum::extract::ws::CloseCode::from(1011u16),
-                                reason: format!("upstream error: {err}").into(),
-                            }))).await;
-                            break;
-                        }
-                    };
-                    match msg {
-                        tungstenite::Message::Text(t) => {
-                            let text = t.to_string();
-                            maybe_capture_response_ws(&app_down, &text).await;
-                            if let Err(err) = client_tx.send(Message::Text(text.into())).await {
-                                eprintln!("[ws→client] 发送错误: {err}");
-                                break;
-                            }
-                        }
-                        tungstenite::Message::Binary(b) => {
-                            if let Err(err) = client_tx.send(Message::Binary(b)).await {
-                                eprintln!("[ws→client] 发送错误: {err}");
-                                break;
-                            }
-                        }
-                        tungstenite::Message::Ping(p) => { let _ = client_tx.send(Message::Ping(p)).await; }
-                        tungstenite::Message::Pong(p) => { let _ = client_tx.send(Message::Pong(p)).await; }
-                        tungstenite::Message::Close(c) => {
-                            eprintln!("[ws] 上游发送 Close 帧，转发给客户端");
-                            let frame = c.map(|f| axum::extract::ws::CloseFrame {
-                                code: axum::extract::ws::CloseCode::from(u16::from(f.code)),
-                                reason: f.reason.to_string().into(),
-                            });
-                            let _ = client_tx.send(Message::Close(frame)).await;
-                            break;
-                        }
-                        tungstenite::Message::Frame(_) => {}
-                    }
-                }
-            }
-        }
-        cancel_down.cancel();
-    };
-
-    // 两个方向同时运行，都结束后才返回
-    tokio::join!(to_up, to_client);
-    Ok(())
-}
-
-/// WS 响应不做 token 捕获，只做占位（未来可扩展失效检测）
-async fn maybe_capture_response_ws(_app: &App, _text: &str) {
-    // 不管上游 WS 返回的 token，只靠 fetch 循环自己打 292
-}
-
-async fn maybe_stamp_ws(app: &App, text: String) -> String {
-    if !turn_state::ws_looks_json_object(&text) {
-        return text;
-    }
-    // 同 HTTP：只有客户端已携带 turn_state 时才替换，首次不注入
-    if !turn_state::ws_has_turn_state(&text) {
-        return text;
-    }
-    let store = app.turn_state.lock().await;
-    let Some(token) = store.peek_freshest() else {
-        return text;
-    };
-    eprintln!("[stamp-ws] 替换 turn_state → 292 token len={}", token.len());
-    turn_state::stamp_ws_json(&text, &token).unwrap_or(text)
-}
+// WebSocket 代理已移除 — 所有 WS 升级请求在 proxy() 入口返回 426，
+// 触发 Codex CLI 自动切换到 HTTP SSE 模式。
+// 这保证了所有请求都经过 proxy_http()，可以可靠地提取 model 并注入对应 token。
 
 fn is_hop(name: &HeaderName) -> bool {
     HOP_BY_HOP
@@ -1000,16 +937,6 @@ pub fn join_upstream(upstream: &str, uri: &Uri) -> Result<String> {
     url = url.join(path).context("join path")?;
     url.set_query(uri.query());
     Ok(url.to_string())
-}
-
-fn to_ws_url(http_url: &str) -> String {
-    if let Some(rest) = http_url.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = http_url.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        http_url.to_string()
-    }
 }
 
 #[cfg(test)]

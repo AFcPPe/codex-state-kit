@@ -186,6 +186,23 @@ pub async fn cancel_chatgpt_login(state: State<'_, AppState>) -> CommandResult<A
 }
 
 #[tauri::command(async)]
+pub async fn set_bound_token_len(
+    state: State<'_, AppState>,
+    len: Option<usize>,
+) -> CommandResult<Status> {
+    Ok(state.proxy.core().set_bound_token_len(len).await)
+}
+
+#[tauri::command(async)]
+pub async fn set_model_bound_token_len(
+    state: State<'_, AppState>,
+    model: String,
+    len: Option<usize>,
+) -> CommandResult<Status> {
+    Ok(state.proxy.core().set_model_bound_token_len(&model, len).await)
+}
+
+#[tauri::command(async)]
 pub async fn open_url(url: String) -> CommandResult<ActionResult> {
     let url = url.trim();
     if !url.starts_with("https://auth.openai.com/") {

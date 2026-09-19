@@ -6,6 +6,8 @@ import {
   pollChatgptLogin,
   refreshTurnState,
   setConfig,
+  setBoundTokenLen,
+  setModelBoundTokenLen,
   openUrl,
   startChatgptLogin,
   openWarpTerms as openWarpTermsApi,
@@ -219,6 +221,26 @@ export function useCodexStateKit() {
     }
   }, [device]);
 
+  const bindTokenLen = useCallback(async (len: number | null) => {
+    try {
+      const next = await setBoundTokenLen(len);
+      setStatus(next);
+      setBanner({ kind: "ok", text: len ? `已全局绑定 ${len} Token` : "已恢复默认全局绑定 292" });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    }
+  }, []);
+
+  const bindModelTokenLen = useCallback(async (model: string, len: number | null) => {
+    try {
+      const next = await setModelBoundTokenLen(model, len);
+      setStatus(next);
+      setBanner({ kind: "ok", text: len ? `${model} 已绑定 ${len} Token` : `${model} 已恢复跟随全局` });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    }
+  }, []);
+
   return {
     status,
     login,
@@ -234,6 +256,8 @@ export function useCodexStateKit() {
     cancelLogin,
     openLoginPage,
     loadLogin,
+    bindTokenLen,
+    bindModelTokenLen,
     dismissBanner: () => setBanner(null),
   };
 }

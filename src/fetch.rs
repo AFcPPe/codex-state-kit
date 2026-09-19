@@ -136,9 +136,9 @@ pub(crate) async fn fetch_turn_state(
     client: &reqwest::Client,
     settings: &Settings,
     creds: &ChatGptCredentials,
+    model: &str,
 ) -> Result<String> {
     let url = responses_url(&settings.upstream);
-    let model = preferred_model(Path::new(&settings.codex_home));
     let response = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", creds.access_token))
@@ -146,7 +146,7 @@ pub(crate) async fn fetch_turn_state(
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
         .header("OpenAI-Beta", "responses=experimental")
-        .json(&probe_body(&model))
+        .json(&probe_body(model))
         .send()
         .await
         .map_err(|err| {
@@ -267,7 +267,7 @@ mod tests {
             upstream,
             ..Settings::default()
         };
-        let token = fetch_turn_state(&http_client("").unwrap(), &settings, &creds())
+        let token = fetch_turn_state(&http_client("").unwrap(), &settings, &creds(), "gpt-6-astra")
             .await
             .unwrap();
         assert_eq!(token, "gAAAAAfetched-token");
@@ -280,7 +280,7 @@ mod tests {
             upstream,
             ..Settings::default()
         };
-        let err = fetch_turn_state(&http_client("").unwrap(), &settings, &creds())
+        let err = fetch_turn_state(&http_client("").unwrap(), &settings, &creds(), "gpt-6-astra")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("未返回"));

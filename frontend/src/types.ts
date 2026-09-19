@@ -6,12 +6,38 @@ export interface LogEntry {
   ms: number;
 }
 
+export interface TokenLenCount {
+  len: number;
+  count: number;
+}
+
+export interface PoolTokenInfo {
+  len: number;
+  ageSecs: number;
+  isBound: boolean;
+  isValid: boolean;
+}
+
+export interface ModelTokenView {
+  model: string;
+  status: "active" | "refreshing" | "expired" | "empty" | string;
+  ageSecs?: number | null;
+  len?: number | null;
+  capturedAt?: string | null;
+  distribution?: TokenLenCount[];
+  poolTokens?: PoolTokenInfo[];
+  /** 模型级绑定覆盖（null/undefined 表示跟随全局） */
+  boundOverride?: number | null;
+}
+
 export interface TurnStateView {
-  status: "empty" | "active" | string;
+  status: "idle" | "active" | "partial" | "empty" | string;
   ageSecs?: number | null;
   len?: number | null;
   source?: string | null;
   capturedAt?: string | null;
+  models?: ModelTokenView[];
+  boundTokenLen?: number;
 }
 
 export interface Status {

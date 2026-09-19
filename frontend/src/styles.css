@@ -186,4 +186,32 @@ svg { flex-shrink: 0; }
 @media (max-width: 900px) { .dash-page { width: calc(100% - 40px); padding-top: 16px; gap: 12px; } .panel { padding: 15px; } .dash-grid { gap: 14px; } .token-card { padding: 15px; } .token-card__badge { display: none; } }
 @media (max-width: 740px) { .dash-grid { grid-template-columns: 1fr; } .connection-section + .connection-section { padding-left: 0; padding-top: 20px; border-left: 0; border-top: 1px solid var(--line); } .field.connection-directory { align-items: stretch; flex-direction: column; gap: 8px; } .page-heading { align-items: flex-start; flex-direction: column; gap: 10px; } .page-actions { justify-content: flex-start; } .titlebar { padding-left: 16px; } .dash-page { width: calc(100% - 32px); } .page-footer > span:last-child { display: none; } }
 @media (max-width: 440px) { .logo__word { font-size: 12px; } .window-controls button { width: 31px; } .token-card { padding: 17px; } .token-card__icon { display: none; } .listening-label { display: none; } .log-empty { padding: 13px; } }
+.token-models { display: flex; flex-direction: column; gap: 8px; width: 100%; padding-top: 10px; border-top: 1px solid #e4ecf4; }
+.token-model-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.token-model { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 6px; font: 10px/1.6 "Cascadia Code", Consolas, monospace; background: #f0f4f8; color: var(--text-soft); }
+.token-model i { width: 5px; height: 5px; border-radius: 50%; }
+.token-model--active i { background: var(--green); }
+.token-model--refreshing i { background: var(--warm); }
+.token-model--expired i { background: var(--red); }
+.token-model--empty i { background: var(--muted); }
+/* 池中缓存 token 展示 */
+.token-pool { display: inline-flex; flex-wrap: wrap; gap: 5px; margin-left: auto; }
+.token-pool__chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text-soft); font-size: 9px; cursor: pointer; transition: all .15s; }
+.token-pool__chip:hover { border-color: var(--accent); color: var(--accent-strong); background: var(--accent-soft); }
+.token-pool__chip--bound { border-color: var(--accent); color: #fff; background: var(--accent); font-weight: 600; }
+.token-pool__chip--bound:hover { background: var(--accent-strong); }
+.token-pool__chip--expired { opacity: .5; border-style: dashed; }
+.token-pool__chip--expired.token-pool__chip--bound { opacity: .7; }
+.token-pool__len { font-family: "Cascadia Code", Consolas, monospace; font-weight: 600; }
+.token-pool__age { font-size: 8px; color: inherit; opacity: .75; }
+.token-pool__bound-tag { display: inline-block; padding: 0 4px; border-radius: 3px; background: rgba(255,255,255,.25); font-size: 8px; font-weight: 700; line-height: 1.5; }
+.token-pool__chip--reset { border-style: dashed; color: var(--muted); font-size: 9px; }
+.token-pool__chip--reset:hover { color: var(--accent-strong); border-color: var(--accent); }
+.token-model__override { margin-left: 6px; padding: 1px 5px; border-radius: 3px; background: var(--accent-soft); color: var(--accent-strong); font-size: 8px; font-weight: 600; }
+/* 分布统计（次要信息） */
+.token-dist { display: inline-flex; gap: 4px; align-items: center; font-size: 9px; color: var(--muted); }
+.token-dist__label { margin-right: 2px; }
+.token-dist__item { padding: 1px 5px; border-radius: 4px; background: #f0f4f8; font-family: "Cascadia Code", Consolas, monospace; }
+.token-card--idle .token-card__icon { color: var(--muted); }
+.token-card--partial .token-card__icon { color: var(--warm); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } .spinner { animation-duration: 1.5s; } }

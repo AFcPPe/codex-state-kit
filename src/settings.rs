@@ -21,6 +21,7 @@ pub struct Settings {
     #[serde(default)]
     pub outbound_mode: OutboundMode,
     pub warp_http2: bool,
+    pub models: Vec<String>,
 }
 
 impl Default for Settings {
@@ -32,6 +33,7 @@ impl Default for Settings {
             outbound_proxy: String::new(),
             outbound_mode: OutboundMode::Warp,
             warp_http2: false,
+            models: vec![],
         }
     }
 }
@@ -62,10 +64,13 @@ pub struct SettingsPatch {
     pub outbound_mode: OutboundMode,
     #[serde(default)]
     pub warp_http2: bool,
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 impl SettingsPatch {
     pub fn into_settings(self) -> Result<Settings> {
+        let models = self.models;
         let settings = Settings {
             proxy_listen: self.proxy_listen.trim().to_string(),
             upstream: self.upstream.trim().to_string(),
@@ -73,6 +78,7 @@ impl SettingsPatch {
             outbound_proxy: normalize_outbound_proxy(&self.outbound_proxy)?,
             outbound_mode: self.outbound_mode,
             warp_http2: self.warp_http2,
+            models,
         };
         if settings.proxy_listen.is_empty()
             || settings.upstream.is_empty()
@@ -177,6 +183,7 @@ mod tests {
             outbound_proxy: "socks5://127.0.0.1:1080".into(),
             outbound_mode: OutboundMode::Manual,
             warp_http2: false,
+            models: vec![],
         }
         .into_settings()
         .unwrap();

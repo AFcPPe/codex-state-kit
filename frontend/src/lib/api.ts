@@ -137,6 +137,20 @@ export async function refreshTurnState(): Promise<Status> {
   return cloneStatus();
 }
 
+export async function setBoundTokenLen(len: number | null): Promise<Status> {
+  if (isTauri) {
+    return invoke<Status>("set_bound_token_len", { len });
+  }
+  return cloneStatus();
+}
+
+export async function setModelBoundTokenLen(model: string, len: number | null): Promise<Status> {
+  if (isTauri) {
+    return invoke<Status>("set_model_bound_token_len", { model, len });
+  }
+  return cloneStatus();
+}
+
 export async function connectWarp(acceptTerms: boolean): Promise<Status> {
   if (isTauri) return invoke<Status>("connect_warp", { acceptTerms });
   if (!mockStatus.warp.registered && !acceptTerms) throw new Error("请先同意 Cloudflare 服务条款");

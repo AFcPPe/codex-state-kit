@@ -4,14 +4,25 @@ use chrono::{SecondsFormat, Utc};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 pub const HEADER_NAME: &str = "x-codex-turn-state";
-pub const MAX_AGE_SECS: i64 = 3600;
+/// Token 有效期：40 分钟
+pub const MAX_AGE_SECS: i64 = 2400;
+/// 提前获取阈值：35 分钟时开始预取下一个 token
+pub const PREFETCH_AGE_SECS: i64 = 2100;
+/// 模型活跃窗口：60 分钟内有请求则视为活跃，持续预取
+const ACTIVE_WINDOW_SECS: i64 = 3600;
 
 /// 正常 token 长度约 292
 pub const QUALITY_TOKEN_LEN: usize = 292;
 /// 降智 token 长度约 312
 pub const DEGRADED_TOKEN_LEN: usize = 312;
+
+/// 每个模型在池中最多保留多少种不同长度的 token
+const MAX_POOL_VARIANTS_PER_MODEL: usize = 10;
+/// 池中 token 最大保留时长（2 小时，超过就清除）
+const POOL_MAX_AGE_SECS: i64 = 7200;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TurnState {
@@ -24,6 +35,42 @@ pub struct TurnState {
     pub captured_at: String,
 }
 
+/// 单种 token 长度的计数
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenLenCount {
+    pub len: usize,
+    pub count: u32,
+}
+
+/// 池中单个缓存 token 的摘要
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolTokenInfo {
+    pub len: usize,
+    pub age_secs: i64,
+    /// 是否匹配当前绑定长度
+    pub is_bound: bool,
+    /// 是否仍在有效期内（≤40min）
+    pub is_valid: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTokenView {
+    pub model: String,
+    pub status: String,
+    pub age_secs: Option<i64>,
+    pub len: Option<usize>,
+    pub captured_at: Option<String>,
+    /// 最近一轮 fetch 的 token 长度分布（各长度出现次数）
+    pub distribution: Vec<TokenLenCount>,
+    /// 池中实际缓存的各长度 token 信息
+    pub pool_tokens: Vec<PoolTokenInfo>,
+    /// 模型级绑定覆盖（None 表示跟随全局）
+    pub bound_override: Option<usize>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnStateView {
@@ -32,11 +79,67 @@ pub struct TurnStateView {
     pub len: Option<usize>,
     pub source: Option<String>,
     pub captured_at: Option<String>,
+    pub models: Vec<ModelTokenView>,
+    /// 当前绑定的 token 长度，默认 292
+    pub bound_token_len: usize,
 }
 
-/// 内存 + 磁盘持久化一个 292 token，重启不丢失。
+// ─── 持久化结构 ───────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct PersistedStore {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    tokens: HashMap<String, TurnState>,
+    /// model → 上次从代理请求中见到的 unix 时间戳
+    #[serde(default)]
+    active_models: HashMap<String, i64>,
+    /// 全局绑定的 token 长度，None = 默认 292
+    #[serde(default)]
+    bound_token_len: Option<usize>,
+    /// 模型级绑定覆盖：model → 该模型专属的绑定长度
+    #[serde(default)]
+    model_bound_lens: HashMap<String, usize>,
+    /// 所有长度的 token 缓存池：model → [各长度的 TurnState]
+    #[serde(default)]
+    pool: HashMap<String, Vec<TurnState>>,
+    /// 每个模型最近一轮 fetch 的 token 长度分布
+    #[serde(default)]
+    distributions: HashMap<String, Vec<TokenLenCount>>,
+}
+
+const PERSIST_VERSION: u32 = 2;
+
+// ─── TurnStateStore ───────────────────────────────────────────
+
+/// 按模型管理 token 池，支持被动发现 + 自动预取。
 pub struct TurnStateStore {
-    current: Option<TurnState>,
+    /// 当前绑定长度的活跃 token（直接用于注入）
+    tokens: HashMap<String, TurnState>,
+    /// 所有长度的 token 缓存：model → [各长度最新 TurnState]
+    pool: HashMap<String, Vec<TurnState>>,
+    /// model → 上次请求经过代理时的 unix 时间戳
+    active_models: HashMap<String, i64>,
+    /// 全局绑定的 token 长度（None = 默认 292）
+    bound_token_len: Option<usize>,
+    /// 模型级绑定覆盖：model → 该模型专属的绑定长度（优先于全局）
+    model_bound_lens: HashMap<String, usize>,
+    /// 每个模型最近一轮 fetch 的 token 长度分布
+    distributions: HashMap<String, Vec<TokenLenCount>>,
+}
+
+impl Default for TurnStateStore {
+    fn default() -> Self {
+        Self {
+            tokens: HashMap::new(),
+            pool: HashMap::new(),
+            active_models: HashMap::new(),
+            bound_token_len: None,
+            model_bound_lens: HashMap::new(),
+            distributions: HashMap::new(),
+        }
+    }
 }
 
 fn token_path() -> std::path::PathBuf {
@@ -50,89 +153,548 @@ fn token_path() -> std::path::PathBuf {
 
 impl TurnStateStore {
     pub fn load() -> Self {
-        let current = std::fs::read_to_string(token_path())
-            .ok()
-            .and_then(|raw| serde_json::from_str::<TurnState>(&raw).ok())
-            .filter(|ts| {
-                // 只恢复 292 token，312 丢弃
-                !is_degraded_token(&ts.token) && ts.token.starts_with("gAAAAA")
-            });
-        if let Some(ref ts) = current {
-            eprintln!(
-                "[token] 从磁盘恢复 292 token（{}字节，age={}s）",
-                ts.len,
-                now_unix() - ts.issued_unix
-            );
+        let raw = match std::fs::read_to_string(token_path()) {
+            Ok(raw) => raw,
+            Err(_) => return Self::default(),
+        };
+
+        // v2 格式
+        if let Ok(store) = serde_json::from_str::<PersistedStore>(&raw) {
+            if store.version >= PERSIST_VERSION {
+                let bound = store.bound_token_len;
+                let tokens: HashMap<String, TurnState> = store
+                    .tokens
+                    .into_iter()
+                    .filter(|(_, ts)| ts.token.starts_with("gAAAAA"))
+                    .collect();
+                // 恢复池——过滤无效 token
+                let pool: HashMap<String, Vec<TurnState>> = store
+                    .pool
+                    .into_iter()
+                    .map(|(model, entries)| {
+                        let valid: Vec<TurnState> = entries
+                            .into_iter()
+                            .filter(|ts| ts.token.starts_with("gAAAAA"))
+                            .collect();
+                        (model, valid)
+                    })
+                    .filter(|(_, v)| !v.is_empty())
+                    .collect();
+                for (model, ts) in &tokens {
+                    eprintln!(
+                        "[token] 从磁盘恢复模型 {} 的 token（{}字节，age={}s）",
+                        model, ts.len, now_unix() - ts.issued_unix
+                    );
+                }
+                let pool_count: usize = pool.values().map(|v| v.len()).sum();
+                if pool_count > 0 {
+                    eprintln!("[token] 恢复 {} 个缓存池 token", pool_count);
+                }
+                let active_count = store.active_models.len();
+                if active_count > 0 {
+                    eprintln!("[token] 恢复 {} 个活跃模型追踪", active_count);
+                }
+                if let Some(bl) = bound {
+                    eprintln!("[token] 恢复绑定 token 长度: {}", bl);
+                }
+                let mbl = store.model_bound_lens;
+                if !mbl.is_empty() {
+                    eprintln!("[token] 恢复 {} 个模型级绑定", mbl.len());
+                }
+                // 兼容：旧版本没有 pool，把 tokens 补入 pool
+                let mut pool = pool;
+                for (model, ts) in &tokens {
+                    let entries = pool.entry(model.clone()).or_default();
+                    if !entries.iter().any(|e| is_matching_token_len(e.len, ts.len)) {
+                        entries.push(ts.clone());
+                        eprintln!("[token] 将 {} 的 token（{}字节）补入缓存池", model, ts.len);
+                    }
+                }
+                let dist = store.distributions;
+                if !dist.is_empty() {
+                    eprintln!("[token] 恢复 {} 个模型的分布数据", dist.len());
+                }
+                return Self {
+                    tokens,
+                    pool,
+                    active_models: store.active_models,
+                    bound_token_len: bound,
+                    model_bound_lens: mbl,
+                    distributions: dist,
+                };
+            }
         }
-        Self { current }
+
+        // v1 格式
+        if let Ok(map) = serde_json::from_str::<HashMap<String, TurnState>>(&raw) {
+            let tokens: HashMap<String, TurnState> = map
+                .into_iter()
+                .filter(|(_, ts)| ts.token.starts_with("gAAAAA"))
+                .collect();
+            if !tokens.is_empty() {
+                let now = now_unix();
+                let active_models: HashMap<String, i64> =
+                    tokens.keys().map(|k| (k.clone(), now)).collect();
+                for (model, ts) in &tokens {
+                    eprintln!(
+                        "[token] 从磁盘恢复 v1 格式模型 {} 的 token（{}字节），自动注册追踪",
+                        model, ts.len
+                    );
+                }
+                // tokens 同步复制到 pool
+                let pool: HashMap<String, Vec<TurnState>> = tokens
+                    .iter()
+                    .map(|(model, ts)| (model.clone(), vec![ts.clone()]))
+                    .collect();
+                return Self {
+                    tokens,
+                    pool,
+                    active_models,
+                    bound_token_len: None,
+                    model_bound_lens: HashMap::new(),
+                    distributions: HashMap::new(),
+                };
+            }
+        }
+
+        // 旧格式：单个 TurnState
+        if let Ok(ts) = serde_json::from_str::<TurnState>(&raw) {
+            if ts.token.starts_with("gAAAAA") {
+                eprintln!("[token] 从磁盘恢复旧格式 token（{}字节），放入 _default", ts.len);
+                let mut tokens = HashMap::new();
+                tokens.insert("_default".to_string(), ts.clone());
+                let mut pool = HashMap::new();
+                pool.insert("_default".to_string(), vec![ts]);
+                return Self {
+                    tokens,
+                    pool,
+                    active_models: HashMap::new(),
+                    bound_token_len: None,
+                    model_bound_lens: HashMap::new(),
+                    distributions: HashMap::new(),
+                };
+            }
+        }
+
+        Self::default()
     }
 
-    fn persist(&self) {
+    fn persist(&mut self) {
+        // 持久化前先清理过期/多余 token
+        self.cleanup_pool();
         let path = token_path();
-        match &self.current {
-            Some(ts) => {
-                if let Ok(raw) = serde_json::to_string_pretty(ts) {
-                    let _ = std::fs::write(&path, raw);
-                }
-            }
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
+        let store = PersistedStore {
+            version: PERSIST_VERSION,
+            tokens: self.tokens.clone(),
+            active_models: self.active_models.clone(),
+            bound_token_len: self.bound_token_len,
+            model_bound_lens: self.model_bound_lens.clone(),
+            pool: self.pool.clone(),
+            distributions: self.distributions.clone(),
+        };
+        if let Ok(raw) = serde_json::to_string_pretty(&store) {
+            let _ = std::fs::write(&path, raw);
         }
     }
 
-    pub fn view(&self) -> TurnStateView {
-        match &self.current {
-            Some(state) => {
-                let age = now_unix() - state.issued_unix;
-                TurnStateView {
-                    status: "active".into(),
-                    age_secs: Some(age),
-                    len: Some(state.len),
-                    source: Some(state.source.clone()).filter(|v| !v.is_empty()),
-                    captured_at: Some(state.captured_at.clone()).filter(|v| !v.is_empty()),
-                }
-            }
-            None => TurnStateView {
-                status: "empty".into(),
-                age_secs: None,
-                len: None,
-                source: None,
-                captured_at: None,
-            },
+    // ─── 模型自动发现 ──────────────────────────────────────────
+
+    /// 从代理请求中发现模型，更新 last_seen 时间戳。
+    /// 返回 true 表示这是一个全新发现的模型。
+    pub fn register_model(&mut self, model: &str) -> bool {
+        let is_new = !self.active_models.contains_key(model);
+        self.active_models.insert(model.to_string(), now_unix());
+        if is_new {
+            self.persist();
         }
+        is_new
     }
 
-    /// 读取当前 292 token（不消费）
-    pub fn peek_freshest(&self) -> Option<String> {
-        self.current.as_ref().map(|s| s.token.clone())
+    /// 返回最近 60 分钟内有请求经过的活跃模型列表。
+    pub fn all_active_models(&self) -> Vec<String> {
+        let cutoff = now_unix() - ACTIVE_WINDOW_SECS;
+        let mut models: Vec<String> = self
+            .active_models
+            .iter()
+            .filter(|(_, &last_seen)| last_seen > cutoff)
+            .map(|(model, _)| model.clone())
+            .collect();
+        models.sort();
+        models
     }
 
-    /// 清除当前 token（服务端拒绝时调用）
-    pub fn invalidate_all(&mut self) {
-        self.current = None;
+    // ─── 绑定 / 分布 ───────────────────────────────────────────
+
+    /// 全局绑定的目标 token 长度
+    pub fn bound_len(&self) -> usize {
+        self.bound_token_len.unwrap_or(QUALITY_TOKEN_LEN)
+    }
+
+    /// 获取某模型实际使用的绑定长度（模型级优先，否则用全局）
+    pub fn bound_len_for(&self, model: &str) -> usize {
+        self.model_bound_lens
+            .get(model)
+            .copied()
+            .unwrap_or_else(|| self.bound_len())
+    }
+
+    /// 获取模型级绑定信息（None 表示跟随全局）
+    pub fn model_bound_len(&self, model: &str) -> Option<usize> {
+        self.model_bound_lens.get(model).copied()
+    }
+
+    /// 设置全局绑定长度（传 None 恢复默认 292）。
+    /// 从 pool 中提升匹配的 token 到 tokens（仅影响没有模型级覆盖的模型）。
+    pub fn set_bound_len(&mut self, len: Option<usize>) {
+        self.bound_token_len = len;
+        self.promote_all_from_pool();
         self.persist();
     }
 
-    /// 存入新 292 token，替换旧的。312 直接拒绝。
-    pub fn capture(&mut self, token: &str, source: &str) -> bool {
-        if is_degraded_token(token) {
-            return false;
+    /// 设置模型级绑定覆盖（传 None 清除覆盖，回退到全局）。
+    pub fn set_model_bound_len(&mut self, model: &str, len: Option<usize>) {
+        match len {
+            Some(l) => { self.model_bound_lens.insert(model.to_string(), l); }
+            None => { self.model_bound_lens.remove(model); }
         }
+        // 仅提升该模型的 token
+        let target = self.bound_len_for(model);
+        let best = self.pool.get(model).and_then(|entries| {
+            entries
+                .iter()
+                .filter(|ts| is_matching_token_len(ts.len, target))
+                .filter(|ts| (now_unix() - ts.issued_unix) <= MAX_AGE_SECS)
+                .max_by_key(|ts| ts.issued_unix)
+                .cloned()
+        });
+        match best {
+            Some(ts) => { self.tokens.insert(model.to_string(), ts); }
+            None => { self.tokens.remove(model); }
+        }
+        self.persist();
+    }
+
+    /// 从 pool 提升所有模型的匹配 token 到 tokens。
+    fn promote_all_from_pool(&mut self) {
+        let promotions: Vec<(String, Option<TurnState>)> = self
+            .pool
+            .iter()
+            .map(|(model, entries)| {
+                let target = self.bound_len_for(model);
+                let best = entries
+                    .iter()
+                    .filter(|ts| is_matching_token_len(ts.len, target))
+                    .filter(|ts| (now_unix() - ts.issued_unix) <= MAX_AGE_SECS)
+                    .max_by_key(|ts| ts.issued_unix)
+                    .cloned();
+                (model.clone(), best)
+            })
+            .collect();
+        for (model, maybe_ts) in promotions {
+            match maybe_ts {
+                Some(ts) => { self.tokens.insert(model, ts); }
+                None => { self.tokens.remove(&model); }
+            }
+        }
+    }
+
+    /// 记录某个模型最近一轮 fetch 的 token 长度分布
+    pub fn record_distribution(&mut self, model: &str, dist: Vec<TokenLenCount>) {
+        self.distributions.insert(model.to_string(), dist);
+    }
+
+    /// 获取某个模型的分布数据
+    pub fn get_distribution(&self, model: &str) -> Vec<TokenLenCount> {
+        self.distributions.get(model).cloned().unwrap_or_default()
+    }
+
+    // ─── Token 操作 ────────────────────────────────────────────
+
+    /// 取特定模型的 token（不消费）。仅返回未过期（≤40min）的 token。
+    pub fn peek_for_model(&self, model: &str) -> Option<String> {
+        self.tokens.get(model).and_then(|ts| {
+            let age = now_unix() - ts.issued_unix;
+            if age <= MAX_AGE_SECS {
+                Some(ts.token.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// ⚠ 已弃用：不同模型 token 不可混用。仅用于测试和兜底。
+    /// 返回任意模型中最新的有效 token。
+    #[allow(dead_code)]
+    pub fn peek_freshest(&self) -> Option<String> {
+        self.tokens
+            .values()
+            .filter(|ts| {
+                let age = now_unix() - ts.issued_unix;
+                age <= MAX_AGE_SECS && !is_degraded_token(&ts.token)
+            })
+            .max_by_key(|ts| ts.issued_unix)
+            .map(|ts| ts.token.clone())
+    }
+
+    /// 判断某个模型是否需要刷新 token：
+    /// - 无 token → 需要
+    /// - token 年龄 > 35 分钟（PREFETCH_AGE_SECS）→ 需要预取
+    pub fn needs_refresh(&self, model: &str) -> bool {
+        match self.tokens.get(model) {
+            None => true,
+            Some(ts) => {
+                let age = now_unix() - ts.issued_unix;
+                age > PREFETCH_AGE_SECS
+            }
+        }
+    }
+
+    /// 清除所有模型的 token 和缓存池（服务端拒绝/降智时调用）。
+    /// 注意：不清除 active_models 追踪，以便立即重新获取。
+    pub fn invalidate_all(&mut self) {
+        self.tokens.clear();
+        self.pool.clear();
+        self.persist();
+    }
+
+    /// 清除指定模型的 token 和缓存池
+    pub fn invalidate_model(&mut self, model: &str) {
+        self.tokens.remove(model);
+        self.pool.remove(model);
+        self.persist();
+    }
+
+    /// 将 token 存入缓存池（不管长度是否匹配绑定）。
+    /// 每个 (model, len_bucket) 只保留最新的一个。
+    pub fn store_to_pool(&mut self, model: &str, token: &str, source: &str) -> bool {
         let Some(state) = TurnState::from_token(token, source) else {
             return false;
         };
-        self.current = Some(state);
-        self.persist();
+        let entries = self.pool.entry(model.to_string()).or_default();
+        // 替换同长度区间的旧 token（±4 范围算同一种）
+        if let Some(pos) = entries
+            .iter()
+            .position(|e| is_matching_token_len(e.len, state.len))
+        {
+            entries[pos] = state.clone();
+        } else {
+            entries.push(state.clone());
+        }
+        // 如果匹配该模型的绑定长度，同时更新 tokens（活跃注入用）
+        let target = self.bound_len_for(model);
+        if is_matching_token_len(state.len, target) {
+            self.tokens.insert(model.to_string(), state);
+        }
         true
     }
 
-    pub fn fresh_count(&self) -> usize {
-        if self.current.is_some() { 1 } else { 0 }
+    /// 批量将一组 token 全部入池，然后一次性持久化。
+    /// 返回匹配绑定长度的 token 数量。
+    pub fn capture_batch(&mut self, model: &str, tokens: &[String], source: &str) -> usize {
+        let target = self.bound_len_for(model);
+        let mut matched = 0;
+        for token in tokens {
+            if self.store_to_pool(model, token, source) {
+                let len = token.trim().len();
+                if is_matching_token_len(len, target) {
+                    matched += 1;
+                }
+            }
+        }
+        self.persist();
+        matched
     }
 
+    /// 兼容旧接口：存入匹配绑定长度的 token 到 tokens + pool。
+    pub fn capture(&mut self, model: &str, token: &str, source: &str) -> bool {
+        let ok = self.store_to_pool(model, token, source);
+        if ok {
+            self.persist();
+        }
+        ok
+    }
+
+    /// 获取某模型在池中所有有效 token 的长度分类。
+    /// 返回按长度排序的 [(len, is_bound_match, age_secs)]。
+    pub fn pool_summary(&self, model: &str) -> Vec<(usize, bool, i64)> {
+        let target = self.bound_len_for(model);
+        let now = now_unix();
+        let mut result: Vec<(usize, bool, i64)> = self
+            .pool
+            .get(model)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|ts| {
+                        let age = now - ts.issued_unix;
+                        age <= MAX_AGE_SECS
+                    })
+                    .map(|ts| {
+                        let age = now - ts.issued_unix;
+                        (ts.len, is_matching_token_len(ts.len, target), age)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        result.sort_by_key(|&(len, _, _)| len);
+        result
+    }
+
+    /// 清理池中过期的 token，防止内存膨胀。
+    /// - 移除超过 POOL_MAX_AGE_SECS（2小时）的 token
+    /// - 每模型最多保留 MAX_POOL_VARIANTS_PER_MODEL 种长度（保最新的）
+    /// - 移除空模型条目
+    pub fn cleanup_pool(&mut self) {
+        let now = now_unix();
+        let mut removed = 0usize;
+
+        for entries in self.pool.values_mut() {
+            let before = entries.len();
+            // 清除过期 token
+            entries.retain(|ts| {
+                let age = now - ts.issued_unix;
+                age <= POOL_MAX_AGE_SECS
+            });
+            removed += before - entries.len();
+
+            // 如果某个模型的 token 种类超出上限，保留最新的 N 个
+            if entries.len() > MAX_POOL_VARIANTS_PER_MODEL {
+                entries.sort_by(|a, b| b.issued_unix.cmp(&a.issued_unix));
+                let excess = entries.len() - MAX_POOL_VARIANTS_PER_MODEL;
+                entries.truncate(MAX_POOL_VARIANTS_PER_MODEL);
+                removed += excess;
+            }
+        }
+
+        // 清除空模型条目
+        self.pool.retain(|_, v| !v.is_empty());
+
+        if removed > 0 {
+            eprintln!("[pool] 清理了 {} 个过期/多余的缓存 token", removed);
+        }
+    }
+
+    /// 所有模型中有效 token 的数量
+    pub fn fresh_count(&self) -> usize {
+        self.tokens
+            .values()
+            .filter(|ts| {
+                let age = now_unix() - ts.issued_unix;
+                age <= MAX_AGE_SECS && !is_degraded_token(&ts.token)
+            })
+            .count()
+    }
+
+    /// ⚠ 已弃用：不同模型 token 不可混用。
+    #[allow(dead_code)]
     pub fn stampable(&self) -> Option<String> {
         self.peek_freshest()
+    }
+
+    // ─── 视图 ──────────────────────────────────────────────────
+
+    /// 生成状态视图，自动展示所有活跃模型。
+    pub fn view(&self) -> TurnStateView {
+        let active = self.all_active_models();
+        self.view_for_models(&active)
+    }
+
+    /// 基于指定模型列表生成视图（内部方法，也用于带 seed 的场景）。
+    fn view_for_models(&self, models: &[String]) -> TurnStateView {
+        let now = now_unix();
+        let model_views: Vec<ModelTokenView> = models
+            .iter()
+            .map(|model| {
+                let dist = self.get_distribution(model);
+                let model_target = self.bound_len_for(model);
+                let model_override = self.model_bound_len(model);
+
+                // 收集池中该模型的所有 token 信息
+                let pool_tokens: Vec<PoolTokenInfo> = self
+                    .pool
+                    .get(model.as_str())
+                    .map(|entries| {
+                        let mut infos: Vec<PoolTokenInfo> = entries
+                            .iter()
+                            .map(|ts| {
+                                let age = now - ts.issued_unix;
+                                PoolTokenInfo {
+                                    len: ts.len,
+                                    age_secs: age,
+                                    is_bound: is_matching_token_len(ts.len, model_target),
+                                    is_valid: age <= MAX_AGE_SECS,
+                                }
+                            })
+                            .collect();
+                        infos.sort_by_key(|i| i.len);
+                        infos
+                    })
+                    .unwrap_or_default();
+
+                match self.tokens.get(model) {
+                    Some(state) => {
+                        let age = now - state.issued_unix;
+                        let status = if age > MAX_AGE_SECS {
+                            "expired"
+                        } else if age > PREFETCH_AGE_SECS {
+                            "refreshing"
+                        } else {
+                            "active"
+                        };
+                        ModelTokenView {
+                            model: model.clone(),
+                            status: status.into(),
+                            age_secs: Some(age),
+                            len: Some(state.len),
+                            captured_at: Some(state.captured_at.clone())
+                                .filter(|v| !v.is_empty()),
+                            distribution: dist,
+                            pool_tokens,
+                            bound_override: model_override,
+                        }
+                    }
+                    None => ModelTokenView {
+                        model: model.clone(),
+                        status: "empty".into(),
+                        age_secs: None,
+                        len: None,
+                        captured_at: None,
+                        distribution: dist,
+                        pool_tokens,
+                        bound_override: model_override,
+                    },
+                }
+            })
+            .collect();
+
+        let overall_status = if model_views.is_empty() {
+            "idle"
+        } else if model_views.iter().all(|v| v.status == "active") {
+            "active"
+        } else if model_views
+            .iter()
+            .any(|v| v.status == "active" || v.status == "refreshing")
+        {
+            "partial"
+        } else {
+            "empty"
+        };
+
+        let freshest = self
+            .tokens
+            .values()
+            .max_by_key(|ts| ts.issued_unix);
+
+        TurnStateView {
+            status: overall_status.into(),
+            age_secs: freshest.map(|ts| now_unix() - ts.issued_unix),
+            len: freshest.map(|ts| ts.len),
+            source: freshest.and_then(|ts| Some(ts.source.clone()).filter(|v| !v.is_empty())),
+            captured_at: freshest
+                .and_then(|ts| Some(ts.captured_at.clone()).filter(|v| !v.is_empty())),
+            models: model_views,
+            bound_token_len: self.bound_len(),
+        }
     }
 }
 
@@ -149,6 +711,8 @@ impl TurnState {
         })
     }
 }
+
+// ─── 公共工具函数 ──────────────────────────────────────────────
 
 pub fn issued_unix(token: &str) -> Option<i64> {
     let token = token.trim();
@@ -226,6 +790,86 @@ pub fn token_from_json(text: &str) -> Option<String> {
     find_token(&value)
 }
 
+/// 从 JSON 请求体中提取 model 字段（自动处理 zstd/gzip/deflate 压缩）
+pub fn extract_model_from_body(bytes: &[u8]) -> Option<String> {
+    // 先尝试原始字节（未压缩 JSON）
+    if let Some(model) = extract_model_from_json(bytes) {
+        return Some(model);
+    }
+    // zstd（magic: 0x28 0xB5 0x2F 0xFD）—— Codex CLI 默认使用 zstd
+    if bytes.len() >= 4 && bytes[0] == 0x28 && bytes[1] == 0xB5 && bytes[2] == 0x2F && bytes[3] == 0xFD {
+        if let Ok(decompressed) = zstd::decode_all(std::io::Cursor::new(bytes)) {
+            if let Some(model) = extract_model_from_json(&decompressed) {
+                return Some(model);
+            }
+        }
+    }
+    // gzip（magic: 0x1f 0x8b）
+    if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        if let Some(model) = try_decompress_and_extract(bytes, "gzip") {
+            return Some(model);
+        }
+    }
+    // deflate/zlib
+    if let Some(model) = try_decompress_and_extract(bytes, "deflate") {
+        return Some(model);
+    }
+    // raw deflate
+    if let Some(model) = try_decompress_and_extract(bytes, "raw_deflate") {
+        return Some(model);
+    }
+    None
+}
+
+fn extract_model_from_json(bytes: &[u8]) -> Option<String> {
+    // JSON 解析
+    if let Ok(v) = serde_json::from_slice::<Value>(bytes) {
+        if let Some(model) = v.get("model").and_then(|v| v.as_str()).map(str::to_string) {
+            return Some(model);
+        }
+    }
+    // 后备：在 UTF-8 文本中搜索 "model":"..."
+    let text = std::str::from_utf8(bytes).ok()?;
+    let needle = "\"model\"";
+    let idx = text.find(needle)?;
+    let after = &text[idx + needle.len()..];
+    let colon_pos = after.find(':')?;
+    let after_colon = after[colon_pos + 1..].trim_start();
+    if after_colon.starts_with('"') {
+        let end = after_colon[1..].find('"')?;
+        let model = &after_colon[1..1 + end];
+        if !model.is_empty() {
+            return Some(model.to_string());
+        }
+    }
+    None
+}
+
+fn try_decompress_and_extract(bytes: &[u8], method: &str) -> Option<String> {
+    use std::io::Read;
+    let mut decompressed = Vec::new();
+    let ok = match method {
+        "gzip" => {
+            let mut decoder = flate2::read::GzDecoder::new(bytes);
+            decoder.read_to_end(&mut decompressed).is_ok()
+        }
+        "deflate" => {
+            let mut decoder = flate2::read::ZlibDecoder::new(bytes);
+            decoder.read_to_end(&mut decompressed).is_ok()
+        }
+        "raw_deflate" => {
+            let mut decoder = flate2::read::DeflateDecoder::new(bytes);
+            decoder.read_to_end(&mut decompressed).is_ok()
+        }
+        _ => false,
+    };
+    if ok && !decompressed.is_empty() {
+        extract_model_from_json(&decompressed)
+    } else {
+        None
+    }
+}
+
 fn find_token(value: &Value) -> Option<String> {
     match value {
         Value::Object(map) => {
@@ -272,19 +916,23 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-/// 判断 token 长度是否属于 312（降智）区间
+/// 判断 token 长度是否与目标长度匹配（±4 容差）
+pub fn is_matching_token_len(actual: usize, target: usize) -> bool {
+    let low = target.saturating_sub(4);
+    let high = target + 4;
+    (low..=high).contains(&actual)
+}
+
 pub fn is_degraded_token(token: &str) -> bool {
     let len = token.trim().len();
     (308..=316).contains(&len)
 }
 
-/// 判断 token 长度是否属于 292（正常）区间
 pub fn is_quality_token(token: &str) -> bool {
     let len = token.trim().len();
     (288..=296).contains(&len)
 }
 
-/// 返回 token 的质量标签
 pub fn token_quality_label(token: &str) -> &'static str {
     if is_quality_token(token) {
         "292/normal"
@@ -300,9 +948,17 @@ mod tests {
     use super::*;
 
     fn token_for(issued: i64) -> String {
+        token_for_len(issued, QUALITY_TOKEN_LEN)
+    }
+
+    /// 生成指定 base64 编码后长度接近 target_len 的 token
+    fn token_for_len(issued: i64, target_len: usize) -> String {
         let mut raw = vec![0x80];
         raw.extend_from_slice(&issued.to_be_bytes());
-        raw.extend_from_slice(&[0u8; 64]);
+        // base64 编码后长度 ≈ ceil(raw_len / 3) * 4
+        // 要达到 target_len 的 base64，需要 raw_len ≈ target_len * 3 / 4
+        let needed_raw = (target_len * 3 / 4).saturating_sub(raw.len());
+        raw.extend_from_slice(&vec![0u8; needed_raw]);
         URL_SAFE.encode(raw)
     }
 
@@ -321,46 +977,123 @@ mod tests {
     }
 
     #[test]
-    fn capture_and_peek() {
-        let mut store = TurnStateStore::load();
-        assert!(store.peek_freshest().is_none());
-        assert_eq!(store.fresh_count(), 0);
+    fn auto_discover_and_peek_for_model() {
+        let mut store = TurnStateStore::default();
+        assert!(store.all_active_models().is_empty());
 
+        // 发现新模型
+        assert!(store.register_model("gpt-6-astra"));
+        assert!(!store.register_model("gpt-6-astra")); // 第二次不是新的
+        assert_eq!(store.all_active_models(), vec!["gpt-6-astra"]);
+
+        // 还没 token
+        assert!(store.peek_for_model("gpt-6-astra").is_none());
+        assert_eq!(store.fresh_count(), 0);
+    }
+
+    #[test]
+    fn capture_and_peek_for_model() {
+        let mut store = TurnStateStore::default();
         let token = token_for(now_unix() - 30);
-        assert!(store.capture(&token, "fetch"));
-        assert_eq!(store.peek_freshest().as_deref(), Some(token.as_str()));
+        assert!(store.capture("gpt-6-astra", &token, "fetch"));
+        assert_eq!(
+            store.peek_for_model("gpt-6-astra").as_deref(),
+            Some(token.as_str())
+        );
+        assert!(store.peek_for_model("o3-pro").is_none());
         assert_eq!(store.fresh_count(), 1);
-        assert_eq!(store.view().status, "active");
     }
 
     #[test]
     fn capture_replaces_old() {
-        let mut store = TurnStateStore::load();
+        let mut store = TurnStateStore::default();
         let old = token_for(now_unix() - 100);
         let new = token_for(now_unix() - 5);
-        store.capture(&old, "fetch");
-        store.capture(&new, "fetch");
-        assert_eq!(store.peek_freshest().as_deref(), Some(new.as_str()));
+        store.capture("gpt-6-astra", &old, "fetch");
+        store.capture("gpt-6-astra", &new, "fetch");
+        assert_eq!(
+            store.peek_for_model("gpt-6-astra").as_deref(),
+            Some(new.as_str())
+        );
         assert_eq!(store.fresh_count(), 1);
     }
 
     #[test]
-    fn invalidate_clears() {
-        let mut store = TurnStateStore::load();
-        let token = token_for(now_unix() - 30);
-        store.capture(&token, "fetch");
-        assert!(store.peek_freshest().is_some());
-        store.invalidate_all();
+    fn multi_model_tokens() {
+        let mut store = TurnStateStore::default();
+        let t1 = token_for(now_unix() - 30);
+        let t2 = token_for(now_unix() - 60);
+        store.capture("gpt-6-astra", &t1, "fetch");
+        store.capture("o3-pro", &t2, "fetch");
+        assert_eq!(store.fresh_count(), 2);
+        assert_eq!(
+            store.peek_for_model("gpt-6-astra").as_deref(),
+            Some(t1.as_str())
+        );
+        assert_eq!(
+            store.peek_for_model("o3-pro").as_deref(),
+            Some(t2.as_str())
+        );
+        assert_eq!(store.peek_freshest().as_deref(), Some(t1.as_str()));
+    }
+
+    #[test]
+    fn needs_refresh_logic() {
+        let mut store = TurnStateStore::default();
+        assert!(store.needs_refresh("gpt-6-astra"));
+
+        let fresh = token_for(now_unix() - 30);
+        store.capture("gpt-6-astra", &fresh, "fetch");
+        assert!(!store.needs_refresh("gpt-6-astra"));
+
+        // 36 分钟 → 需要预取
+        let old = token_for(now_unix() - 2160);
+        store.capture("gpt-6-astra", &old, "fetch");
+        assert!(store.needs_refresh("gpt-6-astra"));
+    }
+
+    #[test]
+    fn expired_token_not_returned() {
+        let mut store = TurnStateStore::default();
+        let expired = token_for(now_unix() - 2460);
+        store.capture("gpt-6-astra", &expired, "fetch");
+        assert!(store.peek_for_model("gpt-6-astra").is_none());
         assert!(store.peek_freshest().is_none());
-        assert_eq!(store.view().status, "empty");
+    }
+
+    #[test]
+    fn invalidate_clears_tokens_not_tracking() {
+        let mut store = TurnStateStore::default();
+        let token = token_for(now_unix() - 30);
+        store.register_model("gpt-6-astra");
+        store.register_model("o3-pro");
+        store.capture("gpt-6-astra", &token, "fetch");
+        store.capture("o3-pro", &token, "fetch");
+        assert_eq!(store.fresh_count(), 2);
+
+        store.invalidate_all();
+        assert_eq!(store.fresh_count(), 0);
+        // 追踪不被清除 → 会立即重新获取
+        assert_eq!(store.all_active_models().len(), 2);
+    }
+
+    #[test]
+    fn invalidate_model_only() {
+        let mut store = TurnStateStore::default();
+        let token = token_for(now_unix() - 30);
+        store.capture("gpt-6-astra", &token, "fetch");
+        store.capture("o3-pro", &token, "fetch");
+        store.invalidate_model("gpt-6-astra");
+        assert!(store.peek_for_model("gpt-6-astra").is_none());
+        assert!(store.peek_for_model("o3-pro").is_some());
     }
 
     #[test]
     fn rejects_312_token() {
-        let mut store = TurnStateStore::load();
+        let mut store = TurnStateStore::default();
         let degraded = "a".repeat(312);
-        assert!(!store.capture(&degraded, "fetch"));
-        assert!(store.peek_freshest().is_none());
+        assert!(!store.capture("gpt-6-astra", &degraded, "fetch"));
+        assert!(store.peek_for_model("gpt-6-astra").is_none());
     }
 
     #[test]
@@ -371,6 +1104,32 @@ mod tests {
         let long = "a".repeat(312);
         assert!(is_degraded_token(&long));
         assert!(!is_quality_token(&long));
+    }
+
+    #[test]
+    fn view_shows_discovered_models() {
+        let mut store = TurnStateStore::default();
+        store.register_model("gpt-6-astra");
+        store.register_model("o3-pro");
+        let token = token_for(now_unix() - 30);
+        store.capture("gpt-6-astra", &token, "fetch");
+
+        let view = store.view();
+        assert_eq!(view.status, "partial"); // one active, one empty
+        assert_eq!(view.models.len(), 2);
+
+        let astra = view.models.iter().find(|m| m.model == "gpt-6-astra").unwrap();
+        assert_eq!(astra.status, "active");
+        let o3 = view.models.iter().find(|m| m.model == "o3-pro").unwrap();
+        assert_eq!(o3.status, "empty");
+    }
+
+    #[test]
+    fn view_idle_when_no_models() {
+        let store = TurnStateStore::default();
+        let view = store.view();
+        assert_eq!(view.status, "idle");
+        assert!(view.models.is_empty());
     }
 
     #[test]
@@ -432,5 +1191,154 @@ mod tests {
         assert_eq!(header_token(&headers).as_deref(), Some(token.as_str()));
         assert!(should_stamp_http("POST", "/backend-api/codex/responses"));
         assert!(!should_stamp_http("GET", "/responses"));
+    }
+
+    #[test]
+    fn extract_model_from_request() {
+        let body = br#"{"model":"gpt-6-astra","input":[{"type":"message"}]}"#;
+        assert_eq!(
+            extract_model_from_body(body).as_deref(),
+            Some("gpt-6-astra")
+        );
+        assert!(extract_model_from_body(b"not-json").is_none());
+        assert!(extract_model_from_body(b"{}").is_none());
+    }
+
+    #[test]
+    fn persistence_round_trip() {
+        let mut store = TurnStateStore::default();
+        store.register_model("gpt-6-astra");
+        store.register_model("o3-pro");
+        let token = token_for(now_unix() - 30);
+        store.capture("gpt-6-astra", &token, "fetch");
+
+        let persisted = PersistedStore {
+            version: PERSIST_VERSION,
+            tokens: store.tokens.clone(),
+            active_models: store.active_models.clone(),
+            bound_token_len: store.bound_token_len,
+            model_bound_lens: store.model_bound_lens.clone(),
+            pool: store.pool.clone(),
+            distributions: store.distributions.clone(),
+        };
+        let json = serde_json::to_string(&persisted).unwrap();
+        let restored: PersistedStore = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.version, PERSIST_VERSION);
+        assert_eq!(restored.tokens.len(), 1);
+        assert_eq!(restored.active_models.len(), 2);
+    }
+
+    #[test]
+    fn bound_len_defaults_to_292() {
+        let store = TurnStateStore::default();
+        assert_eq!(store.bound_len(), QUALITY_TOKEN_LEN);
+    }
+
+    #[test]
+    fn bound_len_filters_capture() {
+        let mut store = TurnStateStore::default();
+        // 默认绑定 292
+        let t292 = token_for(now_unix() - 10);
+        assert!(store.capture("m1", &t292, "fetch"));
+        // 292 匹配绑定 → peek 返回 token
+        assert!(store.peek_for_model("m1").is_some());
+
+        // 323 长度的 token 也能入池（不再拒绝），但 peek 不返回（不匹配绑定）
+        let t323 = token_for_len(now_unix() - 10, 323);
+        assert!(store.capture("m2", &t323, "fetch")); // 入池成功
+        assert!(store.peek_for_model("m2").is_none()); // 但 peek 不返回（绑定是 292）
+        // 池中应该有这个 token
+        let pool_m2 = store.pool_summary("m2");
+        assert_eq!(pool_m2.len(), 1);
+        let actual_len_323 = t323.trim().len();
+        assert_eq!(pool_m2[0].0, actual_len_323); // 实际 token 长度
+        assert!(!pool_m2[0].1);                    // is_bound = false
+
+        // 切换绑定到 323 → 从池中自动提升，无需重新获取
+        store.set_bound_len(Some(323));
+        assert_eq!(store.bound_len(), 323);
+        assert!(store.peek_for_model("m2").is_some()); // 自动从池中提升了
+
+        // 旧 292 token 仍在池中，但 peek 不返回（绑定已改）
+        assert!(store.peek_for_model("m1").is_none());
+        let pool_m1 = store.pool_summary("m1");
+        assert_eq!(pool_m1.len(), 1);
+        assert_eq!(pool_m1[0].0, t292.trim().len()); // 仍然在池中
+
+        // 切回 292 → m1 又可以 peek 了
+        store.set_bound_len(None);
+        assert!(store.peek_for_model("m1").is_some());
+    }
+
+    #[test]
+    fn extract_model_from_gzip_body() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let json = br#"{"model":"gpt-6-astra","input":[{"type":"message"}],"stream":true}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(json).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // 压缩后不是有效 JSON
+        assert!(serde_json::from_slice::<Value>(&compressed).is_err());
+        // 但 extract_model_from_body 应该能自动解压并提取
+        assert_eq!(
+            extract_model_from_body(&compressed).as_deref(),
+            Some("gpt-6-astra")
+        );
+    }
+
+    #[test]
+    fn extract_model_from_zstd_body() {
+        let json = br#"{"model":"gpt-6-astra","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"stream":true}"#;
+        let compressed = zstd::encode_all(std::io::Cursor::new(json), 3).unwrap();
+
+        // 验证 zstd magic
+        assert_eq!(&compressed[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        // extract 应该成功
+        assert_eq!(
+            extract_model_from_body(&compressed).as_deref(),
+            Some("gpt-6-astra")
+        );
+    }
+
+    #[test]
+    fn extract_model_from_deflate_body() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let json = br#"{"model":"o3-pro","input":[]}"#;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(json).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert_eq!(
+            extract_model_from_body(&compressed).as_deref(),
+            Some("o3-pro")
+        );
+    }
+
+    #[test]
+    fn distribution_recording() {
+        let mut store = TurnStateStore::default();
+        assert!(store.get_distribution("m1").is_empty());
+
+        store.record_distribution(
+            "m1",
+            vec![
+                TokenLenCount { len: 292, count: 3 },
+                TokenLenCount { len: 323, count: 7 },
+            ],
+        );
+        let dist = store.get_distribution("m1");
+        assert_eq!(dist.len(), 2);
+        assert_eq!(dist[0].len, 292);
+        assert_eq!(dist[0].count, 3);
+        assert_eq!(dist[1].len, 323);
+        assert_eq!(dist[1].count, 7);
     }
 }
