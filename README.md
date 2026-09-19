@@ -26,6 +26,18 @@
 
 手动代理填写完整 URL，失焦后自动保存，例如 `socks5h://user:password@proxy.example.com:1080`。详细格式见[出站代理与 WARP](docs/warp.md)。
 
+### 如何判断是否拿到有效票据
+
+两张对照图便于直接对比界面状态。有效票据通常是 292 / 332 等质量长度；312 等为降级长度。
+
+获取不到有效票据时，右侧会持续尝试拉取质量 Token，已缓存条目多停留在降级长度。左侧 Codex 也可能出现限流、重试耗尽或无法完成生成。
+
+![获取不到有效票据：持续获取质量 Token，缓存为降级长度](docs/images/kit-token-unavailable.png)
+
+拿到有效票据后，右侧会显示对应长度的 Token 正在复用，各模型也能统计到该长度。左侧 Codex 可正常完成生成。下图对应的完整页面可直接打开查看渲染效果：[在线预览《云端奇想》](https://htmlpreview.github.io/?https://github.com/DouDOU-start/codex-state-kit/blob/master/docs/examples/cloud-flight.html)（[仓库文件](docs/examples/cloud-flight.html)）。
+
+![拿到有效票据：质量 Token 正在复用，Codex 正常出图](docs/images/kit-token-available.png)
+
 ## 主要功能
 
 - **自动接入**：启动后配置 Codex 本地路由，正常退出时恢复。
