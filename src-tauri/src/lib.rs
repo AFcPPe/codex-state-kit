@@ -10,6 +10,7 @@ use state::AppState;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let resource_dir = app.path().resource_dir()?;
             let binary_name = if cfg!(windows) { "usque.exe" } else { "usque" };
@@ -27,15 +28,7 @@ pub fn run() {
             data_dir.push("warp");
             let state = AppState::initialize(WarpPaths { binary, data_dir })
                 .map_err(|err| err.to_string())?;
-            let proxy = state.proxy.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(err) = proxy.start_managed().await {
-                    eprintln!("failed to start proxy: {err:#}");
-                }
-                let attachment = proxy.clone();
-                tauri::async_runtime::spawn(async move { attachment.run_attachment_supervisor().await; });
-                proxy.run_warp_supervisor().await;
-            });
+            state.start_runtime();
             app.manage(state);
             Ok(())
         })
@@ -55,6 +48,11 @@ pub fn run() {
             commands::stop_warp,
             commands::open_warp_terms,
             commands::open_github_repo,
+            commands::check_update,
+            commands::open_release_page,
+            commands::prepare_update,
+            commands::resume_after_update_failure,
+            commands::restart_after_update,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Codex State Kit")

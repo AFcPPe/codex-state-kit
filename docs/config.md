@@ -57,6 +57,7 @@ openai_base_url = "http://127.0.0.1:8787"
 | `codex_home` | Codex 配置目录的完整路径 |
 | `outbound_mode` | `warp` 或 `manual`，新配置默认 `warp` |
 | `outbound_proxy` | 手动代理 URL；切换模式时保留 |
+| `upstream_proxy` | 独立的上游业务转发代理，默认空；例如 `http://127.0.0.1:7897`，保存后对新请求生效 |
 | `warp_http2` | 是否优先使用 TCP，默认 `false`；应用支持自动回退 |
 
 应用设置可能含代理密码，账号和 Token 文件也包含凭据；提交问题报告时不要附上这些文件的原文。

@@ -18,6 +18,7 @@ pub struct Settings {
     pub upstream: String,
     pub codex_home: String,
     pub outbound_proxy: String,
+    pub upstream_proxy: String,
     #[serde(default)]
     pub outbound_mode: OutboundMode,
     pub warp_http2: bool,
@@ -31,6 +32,7 @@ impl Default for Settings {
             upstream: "https://chatgpt.com/backend-api/codex".into(),
             codex_home: home_dir().join(".codex").display().to_string(),
             outbound_proxy: String::new(),
+            upstream_proxy: String::new(),
             outbound_mode: OutboundMode::Warp,
             warp_http2: false,
             models: vec![],
@@ -61,6 +63,8 @@ pub struct SettingsPatch {
     #[serde(default)]
     pub outbound_proxy: String,
     #[serde(default)]
+    pub upstream_proxy: String,
+    #[serde(default)]
     pub outbound_mode: OutboundMode,
     #[serde(default)]
     pub warp_http2: bool,
@@ -76,6 +80,7 @@ impl SettingsPatch {
             upstream: self.upstream.trim().to_string(),
             codex_home: self.codex_home.trim().to_string(),
             outbound_proxy: normalize_outbound_proxy(&self.outbound_proxy)?,
+            upstream_proxy: normalize_proxy(&self.upstream_proxy, "上游转发代理")?,
             outbound_mode: self.outbound_mode,
             warp_http2: self.warp_http2,
             models,
@@ -132,17 +137,21 @@ pub fn save_settings(settings: &Settings) -> Result<()> {
 }
 
 pub fn normalize_outbound_proxy(raw: &str) -> Result<String> {
+    normalize_proxy(raw, "出站代理")
+}
+
+pub fn normalize_proxy(raw: &str, label: &str) -> Result<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(String::new());
     }
-    let url = Url::parse(raw).context("出站代理地址无效")?;
+    let url = Url::parse(raw).with_context(|| format!("{label}地址无效"))?;
     match url.scheme() {
         "http" | "https" | "socks5" | "socks5h" | "socks4" | "socks4a" => {}
-        other => bail!("不支持的出站代理协议: {other}。请用 socks5:// 或 http://"),
+        _ => bail!("不支持的{label}协议。请用 socks5:// 或 http://"),
     }
     if url.host_str().is_none() {
-        bail!("出站代理缺少主机");
+        bail!("{label}缺少主机");
     }
     Ok(raw.to_string())
 }
@@ -150,6 +159,39 @@ pub fn normalize_outbound_proxy(raw: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_proxy_defaults_and_round_trips() {
+        assert!(settings_from_json("{}").unwrap().upstream_proxy.is_empty());
+        for proxy in [
+            "",
+            "http://127.0.0.1:7897",
+            "https://localhost:7897",
+            "socks5://localhost:1080",
+            "socks5h://localhost:1080",
+            "socks4://localhost:1080",
+            "socks4a://localhost:1080",
+        ] {
+            let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
+                "proxyListen": "127.0.0.1:8787", "upstream": "https://example.com",
+                "codexHome": "test", "upstreamProxy": format!(" {proxy} ")
+            }))
+            .unwrap();
+            let settings = patch.into_settings().unwrap();
+            let saved = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(saved.upstream_proxy, proxy);
+        }
+        for proxy in [
+            "not a url",
+            "ftp://user:secret@localhost:21",
+            "http://localhost:99999",
+        ] {
+            let err = normalize_proxy(proxy, "上游转发代理").unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains("上游转发代理"));
+            assert!(!message.contains("secret"));
+        }
+    }
 
     #[test]
     fn empty_outbound_proxy_is_ok() {
@@ -181,6 +223,7 @@ mod tests {
             upstream: "https://chatgpt.com/backend-api/codex".into(),
             codex_home: "/tmp/codex".into(),
             outbound_proxy: "socks5://127.0.0.1:1080".into(),
+            upstream_proxy: String::new(),
             outbound_mode: OutboundMode::Manual,
             warp_http2: false,
             models: vec![],

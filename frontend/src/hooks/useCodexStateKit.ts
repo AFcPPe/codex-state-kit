@@ -91,19 +91,20 @@ export function useCodexStateKit() {
 
   useEffect(() => () => stopPolling(), [stopPolling]);
 
-  const persistSettings = useCallback(async (home: string, outboundProxy: string, current: Status, outboundMode = current.outboundMode, warpHttp2 = current.warpHttp2) => {
-    if (home === current.codexHome && outboundProxy === current.outboundProxy && outboundMode === current.outboundMode && warpHttp2 === current.warpHttp2) return current;
+  const persistSettings = useCallback(async (home: string, outboundProxy: string, current: Status, outboundMode = current.outboundMode, warpHttp2 = current.warpHttp2, upstreamProxy = current.upstreamProxy) => {
+    if (home === current.codexHome && outboundProxy === current.outboundProxy && outboundMode === current.outboundMode && warpHttp2 === current.warpHttp2 && upstreamProxy === current.upstreamProxy) return current;
     return setConfig({
       proxyListen: current.proxyListen,
       upstream: current.upstream,
       codexHome: home,
       outboundProxy,
+      upstreamProxy,
       outboundMode,
       warpHttp2,
     });
   }, []);
 
-  const saveSettings = useCallback(async (home: string, outboundProxy: string, outboundMode?: OutboundMode, warpHttp2?: boolean) => {
+  const saveSettings = useCallback(async (home: string, outboundProxy: string, outboundMode?: OutboundMode, warpHttp2?: boolean, upstreamProxy?: string) => {
     setBusy("save");
     try {
       const latest = await getStatus();
@@ -112,7 +113,7 @@ export function useCodexStateKit() {
         setDevice(null);
         await cancelChatgptLogin();
       }
-      const next = await persistSettings(home.trim(), outboundProxy, latest, outboundMode, warpHttp2);
+      const next = await persistSettings(home.trim(), outboundProxy, latest, outboundMode, warpHttp2, upstreamProxy?.trim());
       if (next.codexHome !== latest.codexHome) {
         await loadLogin(next.codexHome);
       }

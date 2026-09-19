@@ -35,6 +35,8 @@ pub struct AppState {
     pub proxy: ProxyHandle,
     pub pending_login: Mutex<LoginSlot>,
     restored: AtomicBool,
+    update_prepared: AtomicBool,
+    supervisors: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -50,6 +52,8 @@ impl AppState {
             proxy,
             pending_login: Mutex::new(LoginSlot::default()),
             restored: AtomicBool::new(false),
+            update_prepared: AtomicBool::new(false),
+            supervisors: Mutex::new(Vec::new()),
         })
     }
 
@@ -57,10 +61,65 @@ impl AppState {
         self.proxy.app()
     }
 
+    pub fn start_runtime(&self) {
+        let mut tasks = self.supervisors.lock().expect("supervisors");
+        let proxy = self.proxy.clone();
+        tasks.push(tauri::async_runtime::spawn(async move {
+            if let Err(err) = proxy.start_managed().await {
+                eprintln!("failed to start proxy: {err:#}");
+            }
+        }));
+        let proxy = self.proxy.clone();
+        tasks.push(tauri::async_runtime::spawn(async move {
+            proxy.run_attachment_supervisor().await;
+        }));
+        let proxy = self.proxy.clone();
+        tasks.push(tauri::async_runtime::spawn(async move {
+            proxy.run_warp_supervisor().await;
+        }));
+    }
+
+    fn stop_supervisors(&self) {
+        for task in self.supervisors.lock().expect("supervisors").drain(..) {
+            task.abort();
+        }
+    }
+
+    pub async fn prepare_update(&self) -> Result<()> {
+        if self.update_prepared.swap(true, Ordering::SeqCst) {
+            anyhow::bail!("更新安装已在进行中");
+        }
+        self.stop_supervisors();
+        self.pending_login.lock().expect("pending login").cancel();
+        if let Err(err) = self.proxy.restore_managed_routes() {
+            self.resume_after_update_failure();
+            return Err(err);
+        }
+        // Await cleanup before the Windows updater exits the process directly.
+        self.proxy.app().warp.stop().await;
+        self.proxy.stop().await;
+        self.restored.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn resume_after_update_failure(&self) {
+        if !self.update_prepared.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.restored.store(false, Ordering::SeqCst);
+        self.proxy.enable_auto_attach();
+        self.start_runtime();
+    }
+
+    pub fn update_is_prepared(&self) -> bool {
+        self.update_prepared.load(Ordering::SeqCst) && self.restored.load(Ordering::SeqCst)
+    }
+
     pub fn restore_once(&self) {
         if self.restored.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.stop_supervisors();
         {
             let mut login = self.pending_login.lock().expect("pending login");
             login.closed = true;

@@ -34,6 +34,7 @@ const defaultStatus = (): Status => ({
   proxyError: null,
   attachError: null,
   outboundProxy: "",
+  upstreamProxy: "",
   outboundMode: "warp",
   warpHttp2: false,
   warp: { available: true, registered: true, phase: "connected", proxyUrl: null, exitIp: null, country: null, error: null },
@@ -80,10 +81,11 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
   if (isTauri) {
     return invoke<Status>("set_config", { settings });
   }
-  if (settings.outboundMode === "manual" || settings.warpHttp2 !== mockStatus.warpHttp2) {
+  const tokenRouteChanged = settings.outboundMode !== mockStatus.outboundMode || settings.warpHttp2 !== mockStatus.warpHttp2 || settings.outboundProxy !== mockStatus.outboundProxy || settings.codexHome !== mockStatus.codexHome || settings.upstream !== mockStatus.upstream;
+  if (tokenRouteChanged && (settings.outboundMode === "manual" || settings.warpHttp2 !== mockStatus.warpHttp2)) {
     await stopWarp();
   }
-  if (settings.codexHome !== mockStatus.codexHome || settings.outboundMode !== mockStatus.outboundMode || settings.outboundProxy !== mockStatus.outboundProxy) {
+  if (tokenRouteChanged) {
     mockStatus.turnState = emptyTurnState();
   }
   mockStatus = {
@@ -92,13 +94,14 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
     upstream: settings.upstream,
     codexHome: settings.codexHome,
     outboundProxy: settings.outboundProxy,
+    upstreamProxy: settings.upstreamProxy,
     outboundMode: settings.outboundMode,
     warpHttp2: settings.warpHttp2,
     proxyOk: true,
   };
   mockConfig.codexHome = settings.codexHome;
   mockConfig.suggestedBaseUrl = `http://${settings.proxyListen}`;
-  if (settings.outboundMode === "warp") await connectWarp(true);
+  if (tokenRouteChanged && settings.outboundMode === "warp") await connectWarp(true);
   return cloneStatus();
 }
 

@@ -2,7 +2,7 @@
 
 [返回首页](../README.md)
 
-出站代理用于获取 Turn-State。Codex 业务请求经过本机代理转发，不会主动使用界面中配置的 WARP 或手动代理。
+Token 获取代理用于获取 Turn-State。Codex 业务请求经过本机代理转发，使用独立的「上游转发代理」设置。WARP 和 Token 手动代理仍仅用于获取 Turn-State。
 
 ## 内置 WARP
 
@@ -34,6 +34,20 @@ socks5h://user:password@proxy.example.com:1080
 建议使用 HTTP 或 SOCKS5；获取 Turn-State 时，`socks5://` 会转换为 `socks5h://`，由代理解析域名。账号和密码中的特殊字符需进行 URL 编码。
 
 切换到 WARP 会保留手动地址。旧配置已设置代理时继续使用原模式；没有代理且未保存模式的旧配置迁移为 WARP。
+
+## 上游转发代理
+
+在「Token 获取代理」区域下方填写独立的「上游转发代理」，例如 Clash 的 HTTP / mixed 端口：
+
+```text
+http://127.0.0.1:7897
+```
+
+保持 Clash 运行，填写实际监听端口，无需开启 TUN。支持 HTTP、HTTPS 和 SOCKS；`socks5://` 使用代理端 DNS。认证信息可写入 URL，特殊字符需要 URL 编码。
+
+失焦或 Enter 保存后，新业务请求立即使用新代理，在途流式响应继续完成。此设置不影响登录、Token 获取代理或 WARP，也不清空 Token 缓存。留空恢复原有默认网络行为（可能受进程代理环境变量影响），并非强制直连。本功能不增加操作系统代理自动识别。
+
+代理不可用时业务请求返回 502，不会自动退回直连。WebSocket 仍返回 426，由客户端回退到 HTTP SSE。
 
 ## 数据与分发
 

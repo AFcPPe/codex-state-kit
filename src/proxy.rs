@@ -65,6 +65,7 @@ pub struct Status {
     pub proxy_error: Option<String>,
     pub attach_error: Option<String>,
     pub outbound_proxy: String,
+    pub upstream_proxy: String,
     pub outbound_mode: OutboundMode,
     pub warp_http2: bool,
     pub warp: WarpStatus,
@@ -88,7 +89,7 @@ pub struct App {
     fetch_ok_at: Mutex<Option<String>>,
     fetch_round: AtomicU32,
     turn_state: Mutex<TurnStateStore>,
-    http: reqwest::Client,
+    http: Mutex<reqwest::Client>,
     degraded: AtomicBool,
     degraded_at: Mutex<Option<String>>,
     pub degrade_notify: Notify,
@@ -105,6 +106,7 @@ impl App {
     }
 
     pub fn with_warp(settings: Settings, warp: WarpRuntime) -> Result<Self> {
+        let http = upstream_http_client(&settings.upstream_proxy)?;
         Ok(Self {
             warp,
             settings: Mutex::new(settings),
@@ -117,9 +119,7 @@ impl App {
             fetch_ok_at: Mutex::new(None),
             fetch_round: AtomicU32::new(0),
             turn_state: Mutex::new(TurnStateStore::load()),
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::limited(5))
-                .build()?,
+            http: Mutex::new(http),
             degraded: AtomicBool::new(false),
             degraded_at: Mutex::new(None),
             degrade_notify: Notify::new(),
@@ -159,6 +159,7 @@ impl App {
             proxy_error: self.proxy_error.lock().await.clone(),
             attach_error: None,
             outbound_proxy: settings.outbound_proxy,
+            upstream_proxy: settings.upstream_proxy,
             outbound_mode: settings.outbound_mode,
             warp_http2: settings.warp_http2,
             warp: self.warp.status(),
@@ -646,6 +647,11 @@ impl ProxyHandle {
             self.settings_change.lock().await
         };
         let old = self.app.settings.lock().await.clone();
+        let next_http = if old.upstream_proxy != next.upstream_proxy {
+            Some(upstream_http_client(&next.upstream_proxy)?)
+        } else {
+            None
+        };
         if old.codex_home != next.codex_home {
             attach::validate_codex_home(Path::new(&next.codex_home))?;
         }
@@ -673,6 +679,9 @@ impl ProxyHandle {
         {
             let mut settings = self.app.settings.lock().await;
             *settings = next.clone();
+            if let Some(http) = next_http {
+                *self.app.http.lock().await = http;
+            }
         }
         if old.proxy_listen != next.proxy_listen {
             if let Err(err) = self.start().await {
@@ -799,8 +808,30 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
     }
 }
 
+fn upstream_http_client(proxy: &str) -> Result<reqwest::Client> {
+    let proxy = crate::settings::normalize_proxy(proxy, "上游转发代理")?;
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::limited(5));
+    if !proxy.is_empty() {
+        let proxy = reqwest::Proxy::all(fetch::outbound_proxy_for_client(&proxy))
+            .map_err(|_| anyhow::anyhow!("上游转发代理地址无效"))?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|_| anyhow::anyhow!("无法创建上游转发客户端"))
+}
+
 async fn forward_http(app: &App, req: Request<Body>) -> Result<Response> {
-    let upstream = app.settings.lock().await.upstream.clone();
+    let (upstream, home, http) = {
+        let settings = app.settings.lock().await;
+        (
+            settings.upstream.clone(),
+            settings.codex_home.clone(),
+            app.http.lock().await.clone(),
+        )
+    };
     let (mut parts, body) = req.into_parts();
     let target = join_upstream(&upstream, &parts.uri)?;
     let path = parts.uri.path();
@@ -873,10 +904,8 @@ async fn forward_http(app: &App, req: Request<Body>) -> Result<Response> {
             );
         }
     }
-    let home = app.settings.lock().await.codex_home.clone();
     login::apply_kit_auth_headers(&mut parts.headers, Path::new(&home));
-    let mut builder = app
-        .http
+    let mut builder = http
         .request(
             reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?,
             target,
@@ -955,6 +984,10 @@ pub fn join_upstream(upstream: &str, uri: &Uri) -> Result<String> {
     url.set_query(uri.query());
     Ok(url.to_string())
 }
+
+#[cfg(test)]
+#[path = "upstream_proxy_tests.rs"]
+mod upstream_proxy_tests;
 
 #[cfg(test)]
 mod tests {

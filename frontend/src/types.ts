@@ -49,6 +49,7 @@ export interface Status {
   proxyError?: string | null;
   attachError?: string | null;
   outboundProxy: string;
+  upstreamProxy: string;
   outboundMode: OutboundMode;
   warpHttp2: boolean;
   warp: WarpStatus;
@@ -65,6 +66,7 @@ export interface SettingsPatch {
   upstream: string;
   codexHome: string;
   outboundProxy: string;
+  upstreamProxy: string;
   outboundMode: OutboundMode;
   warpHttp2: boolean;
 }

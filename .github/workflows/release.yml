@@ -14,12 +14,53 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.verify.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检查更新清单验证器
+        run: node --test tools/verify-updater-manifest.test.mjs
+      - name: 检查版本与签名配置
+        id: verify
+        uses: actions/github-script@v7
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          script: |
+            if (!process.env.SIGNING_KEY || !process.env.SIGNING_PASSWORD) {
+              throw new Error('请先配置 TAURI_SIGNING_PRIVATE_KEY 和 TAURI_SIGNING_PRIVATE_KEY_PASSWORD Secrets');
+            }
+            const fs = require('fs');
+            const version = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
+            if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('正式发布必须使用稳定 SemVer 版本');
+            for (const file of ['Cargo.toml', 'src-tauri/Cargo.toml']) {
+              const rustVersion = fs.readFileSync(file, 'utf8').match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+              if (rustVersion !== version) throw new Error(`${file} 版本与 package.json 不一致`);
+            }
+            const tag = `v${version}`;
+            if (context.ref.startsWith('refs/tags/') && context.ref !== `refs/tags/${tag}`) throw new Error('标签与安装包版本不一致');
+            try {
+              const { data } = await github.rest.repos.getReleaseByTag({ ...context.repo, tag });
+              if (!data.draft) throw new Error('该版本已经发布；请提高版本号，避免覆盖已有更新包');
+            } catch (error) { if (error.status !== 404) throw error; }
+            core.setOutput('tag', tag);
+
   publish:
+    needs: preflight
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
+      # Serialize latest.json merges; the release stays draft until all targets are complete.
+      max-parallel: 1
       matrix:
         include:
           - name: Windows x64
@@ -100,12 +141,32 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: v__VERSION__
           releaseName: Codex State Kit v__VERSION__
           releaseBody: ${{ steps.notes.outputs.body }}
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.target_args }}
           retryAttempts: 2
           releaseAssetNamePattern: "[name]-[version]-[platform]-[arch][setup].[ext]"
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+
+  finalize:
+    needs: [preflight, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 验证更新清单并公开发布
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release download "$RELEASE_TAG" --pattern latest.json --dir "$RUNNER_TEMP/updater"
+          gh release view "$RELEASE_TAG" --json assets > "$RUNNER_TEMP/updater/assets.json"
+          node tools/verify-updater-manifest.mjs "$RUNNER_TEMP/updater/latest.json" "$RUNNER_TEMP/updater/assets.json" "$RELEASE_TAG" "$GH_REPO"
+          gh release edit "$RELEASE_TAG" --draft=false --latest

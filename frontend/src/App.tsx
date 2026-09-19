@@ -112,6 +112,7 @@ export default function App() {
   const fwd = useCodexStateKit();
   const [codexHome, setCodexHome] = useState("");
   const [outboundProxy, setOutboundProxy] = useState("");
+  const [upstreamProxy, setUpstreamProxy] = useState("");
   const [loginMethod, setLoginMethod] = useState<LoginMethod>("browser");
   const hydrated = useRef(false);
 
@@ -120,6 +121,7 @@ export default function App() {
     hydrated.current = true;
     setCodexHome(fwd.status.codexHome);
     setOutboundProxy(fwd.status.outboundProxy ?? "");
+    setUpstreamProxy(fwd.status.upstreamProxy ?? "");
   }, [fwd.status]);
 
 
@@ -307,7 +309,7 @@ export default function App() {
         <div className="panel dash-grid">
         <section className="connection-section panel--proxy">
           <header>
-            <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>出站代理</h2><p>为 Token 获取配置网络</p></div></div>
+            <div className="section-heading"><span className="section-icon"><Network size={19} /></span><div><h2>Token 获取代理</h2><p>为 Token 获取配置网络</p></div></div>
             <span className="section-step">01</span>
           </header>
           <div className="proxy-mode" role="group" aria-label="出站代理模式">
@@ -333,6 +335,23 @@ export default function App() {
           </label>
           <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。</p>
           </> : <WarpPanel status={fwd.status.warp} onTerms={() => void fwd.openWarpTerms()} />}
+          <label className="field">
+            <span>上游转发代理</span>
+            <input
+              type="text"
+              spellCheck={false}
+              autoComplete="off"
+              disabled={fwd.busy !== null}
+              value={upstreamProxy}
+              placeholder="http://127.0.0.1:7897"
+              onChange={(event) => setUpstreamProxy(event.target.value)}
+              onBlur={() => void fwd.saveSettings(codexHome, outboundProxy, undefined, undefined, upstreamProxy)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void fwd.saveSettings(codexHome, outboundProxy, undefined, undefined, upstreamProxy);
+              }}
+            />
+          </label>
+          <p className="panel__hint">仅用于业务转发，留空保持默认网络行为。支持 HTTP / HTTPS / SOCKS，失焦或 Enter 自动保存。</p>
         </section>
 
         <section className="connection-section">

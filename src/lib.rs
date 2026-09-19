@@ -7,6 +7,7 @@ pub mod proxy;
 pub mod settings;
 pub mod turn_state;
 pub mod warp;
+pub mod update;
 
 pub use attach::{
     attach_codex_config, inspect_codex_config, restore_codex_config, update_attached_base_url,

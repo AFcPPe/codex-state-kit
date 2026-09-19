@@ -46,6 +46,34 @@ pub async fn open_github_repo() -> CommandResult<()> {
     open::that("https://github.com/DouDOU-start/codex-state-kit").map_err(|err| err.to_string())
 }
 
+#[tauri::command]
+pub async fn check_update(app: tauri::AppHandle) -> CommandResult<codex_state_kit::update::UpdateInfo> {
+    command(codex_state_kit::update::check_update(&app.package_info().version.to_string()).await)
+}
+
+#[tauri::command]
+pub async fn open_release_page(tag: Option<String>) -> CommandResult<()> {
+    let url = command(codex_state_kit::update::release_url(tag.as_deref()))?;
+    open::that(url).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn prepare_update(state: tauri::State<'_, AppState>) -> CommandResult<()> {
+    command(state.prepare_update().await)
+}
+
+#[tauri::command]
+pub async fn resume_after_update_failure(state: tauri::State<'_, AppState>) -> CommandResult<()> {
+    state.resume_after_update_failure();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn restart_after_update(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> CommandResult<()> {
+    if !state.update_is_prepared() { return Err("尚未准备更新安装".into()); }
+    app.restart();
+}
+
 #[tauri::command(async)]
 pub async fn get_status(state: State<'_, AppState>) -> CommandResult<Status> {
     Ok(state.proxy.managed_status().await)

@@ -1,0 +1,1 @@
+Codex State Kit updater signing verification fixture. Not an installer.

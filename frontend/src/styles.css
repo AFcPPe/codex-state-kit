@@ -46,6 +46,11 @@ svg { flex-shrink: 0; }
 .titlebar__identity { display: flex; align-items: center; gap: 9px; }
 .app-version { padding: 2px 6px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font: 10px/1.4 Consolas, monospace; background: var(--surface-raised); }
 .titlebar__actions { display: flex; align-items: center; gap: 12px; height: 100%; }
+.update-check { border: 0; padding: 5px 7px; border-radius: 5px; background: transparent; color: var(--accent); font-size: 11px; cursor: pointer; }
+.update-check:hover { background: var(--accent-soft); }
+.update-notice { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin: 12px 20px 0; padding: 12px 14px; border: 1px solid #d4e2f2; border-radius: 9px; background: var(--accent-soft); color: var(--text-soft); font-size: 12px; line-height: 1.6; }
+.update-notice__actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.update-notice button { display: inline-flex; align-items: center; gap: 5px; border: 0; padding: 4px 6px; background: transparent; color: var(--accent-strong); cursor: pointer; }
 .window-controls { display: flex; height: 100%; }
 .window-controls button { display: grid; width: 40px; padding: 0; place-items: center; border: 0; color: var(--muted); background: transparent; cursor: pointer; transition: background .15s; }
 .window-controls button:hover { color: var(--text); background: #eaf0f5; }
