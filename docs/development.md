@@ -40,7 +40,7 @@ corepack pnpm dev
 
 推送形如 `v0.0.1` 的标签会触发 `.github/workflows/release.yml`，并行构建 Windows x64、macOS Intel 和 macOS Apple Silicon，随后将 `.exe`、`.msi` 和 `.dmg` 上传到同一个 GitHub Release。也可以在 Actions 页面手动运行工作流。
 
-发布说明来自**附注标签**的正文，不要用轻量标签。PowerShell 示例：
+发布说明来自**附注标签**的正文，不要用轻量标签。附注里不要写以 `#` 开头的行（Git 会当成注释丢掉），小标题直接写「功能」「本次更新」即可。PowerShell 示例：
 
 ```powershell
 git tag -a v0.0.4 -m @"
