@@ -6,6 +6,11 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      finalize_only:
+        description: "仅验证并公开已完整构建的草稿，不重新构建安装包"
+        required: false
+        default: false
+        type: boolean
       notes:
         description: "发布说明。留空则使用标签附注，再没有则用默认文案"
         required: false
@@ -55,6 +60,7 @@ jobs:
 
   publish:
     needs: preflight
+    if: ${{ !inputs.finalize_only }}
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -157,6 +163,7 @@ jobs:
 
   finalize:
     needs: [preflight, publish]
+    if: ${{ always() && needs.preflight.result == 'success' && (needs.publish.result == 'success' || (inputs.finalize_only && needs.publish.result == 'skipped')) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -169,4 +176,5 @@ jobs:
           gh release download "$RELEASE_TAG" --pattern latest.json --dir "$RUNNER_TEMP/updater"
           gh release view "$RELEASE_TAG" --json assets > "$RUNNER_TEMP/updater/assets.json"
           node tools/verify-updater-manifest.mjs "$RUNNER_TEMP/updater/latest.json" "$RUNNER_TEMP/updater/assets.json" "$RELEASE_TAG" "$GH_REPO"
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/updater/latest.json" --clobber
           gh release edit "$RELEASE_TAG" --draft=false --latest

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { verifyManifest } from './verify-updater-manifest.mjs';
+import { verifyManifest, prepareManifest } from './verify-updater-manifest.mjs';
 
 const repo = 'DouDOU-start/codex-state-kit';
 function fixture() {
@@ -35,4 +35,15 @@ test('rejects mismatched versions and foreign downloads', () => {
   assert.throws(() => verifyManifest(manifest, assets, 'v0.0.6', repo));
   manifest.platforms['windows-x86_64'].url = 'https://evil.example/setup.exe';
   assert.throws(() => verifyManifest(manifest, assets, 'v0.0.5', repo));
+});
+
+test('converts draft API URLs using only assets belonging to this release', () => {
+  const { manifest, assets } = fixture();
+  const original = manifest.platforms['windows-x86_64'].url;
+  assets[0].apiUrl = `https://api.github.com/repos/${repo}/releases/assets/123`;
+  manifest.platforms['windows-x86_64'].url = assets[0].apiUrl;
+  prepareManifest(manifest, assets, 'v0.0.5', repo);
+  assert.equal(manifest.platforms['windows-x86_64'].url, original);
+  manifest.platforms['windows-x86_64'].url = `https://api.github.com/repos/${repo}/releases/assets/999`;
+  assert.throws(() => prepareManifest(manifest, assets, 'v0.0.5', repo));
 });
