@@ -192,6 +192,7 @@ svg { flex-shrink: 0; }
 .network-log-close:hover { color: var(--text); border-color: #cbd7e2; background: #eef3f7; }
 .network-log-close:focus-visible { outline: 3px solid #89acd4; outline-offset: 2px; }
 .network-route-overview { flex: 0 0 auto; padding: 11px 18px; border-bottom: 1px solid var(--line); background: #f7f9fb; }
+.network-log-preview-note { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; color: #8b5b16; font-size: 10px; font-weight: 600; }
 .network-route-line { display: grid; grid-template-columns: 88px minmax(0, 1fr); align-items: start; gap: 12px; padding: 5px 0; }
 .network-route-line__label { display: inline-flex; align-items: center; gap: 6px; color: var(--text-soft); font-size: 10px; font-weight: 600; white-space: nowrap; }
 .network-route-line__path { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 4px; color: #53697f; font: 9px/1.7 "Cascadia Code", Consolas, monospace; }

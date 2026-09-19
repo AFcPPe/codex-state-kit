@@ -4,7 +4,9 @@ import Copy from "lucide-react/dist/esm/icons/copy.js";
 import Network from "lucide-react/dist/esm/icons/network.js";
 import Route from "lucide-react/dist/esm/icons/route.js";
 import Shield from "lucide-react/dist/esm/icons/shield.js";
+import TriangleAlert from "lucide-react/dist/esm/icons/triangle-alert.js";
 import X from "lucide-react/dist/esm/icons/x.js";
+import { isTauri } from "@/lib/api";
 import type { LogEntry, Status } from "@/types";
 
 interface NetworkLogDialogProps {
@@ -201,7 +203,7 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
             <span className="network-log-dialog__mark" aria-hidden="true"><Route size={19} /></span>
             <div>
               <h2 id="network-log-title">网络路由日志</h2>
-              <p>{status.logs.length} 条请求记录 · 自动实时更新</p>
+              <p>{isTauri ? `${status.logs.length} 条请求记录 · 自动实时更新` : `${status.logs.length} 条示例记录 · 非实际连接`}</p>
             </div>
           </div>
           <div className="network-log-dialog__actions">
@@ -216,6 +218,11 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
         </header>
 
         <section className="network-route-overview" aria-label="当前网络路径">
+          {!isTauri ? (
+            <div className="network-log-preview-note" role="note">
+              <TriangleAlert size={14} />浏览器预览数据，不代表当前网络连接
+            </div>
+          ) : null}
           <RouteLine icon="ticket" label="Token 获取" nodes={ticketRoute(status)} />
           <RouteLine icon="business" label="业务请求" nodes={businessRoute(status)} />
         </section>
