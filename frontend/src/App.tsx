@@ -398,7 +398,7 @@ export default function App() {
             )}
           </div>
           <p className="panel__hint">
-            启动后自动接入。运行期间把 Kit 账号同步到 Codex 窗口和用量；关闭时还原原来的官方账号和路由。若用量窗口还没刷新，重开一次 Codex 即可。
+            启动后自动接入。运行期间把 Kit 账号同步到 Codex 窗口和用量，并按官方登录生成模型目录（含思考等级 ultra 和 Fast）；关闭时还原原来的官方账号、路由和本地模型配置。若窗口还没刷新，重开一次 Codex 即可。
           </p>
         </section>
           <label className="field connection-directory">

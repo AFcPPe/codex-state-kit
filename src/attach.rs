@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table};
 use url::Url;
@@ -8,6 +9,30 @@ use crate::login::{has_chatgpt_login, overlay_kit_onto_official, restore_officia
 use crate::settings::{home_dir, Settings};
 
 pub const PROVIDER_ID: &str = "codex_state_kit";
+const OFFICIAL_DEFAULT_MODEL: &str = "gpt-6-astra";
+const MODEL_OVERLAY_VERSION: u32 = 2;
+const LAST_SELECTED_ATOM: &str = "chatgpt-last-selected-model-v1";
+const MODEL_OVERLAY_KEYS: &[&str] = &[
+    "model",
+    "model_reasoning_effort",
+    "model_reasoning_summary",
+    "model_verbosity",
+    "service_tier",
+    "plan_mode_reasoning_effort",
+    "review_model",
+    "model_catalog_json",
+];
+const CUSTOM_MODEL_CATALOGS: &[&str] = &["cc-switch-model-catalog.json"];
+const KIT_MODEL_CATALOG: &str = "codex-state-kit-model-catalog.json";
+const OFFICIAL_MODELS_CACHE: &str = "models_cache.json";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeySnapshot {
+    #[serde(default)]
+    pub present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Backup {
@@ -24,6 +49,22 @@ pub struct Backup {
     pub previous_cli_auth_store: Option<String>,
     #[serde(default)]
     pub had_cli_auth_store_key: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_model: Option<String>,
+    #[serde(default)]
+    pub had_model_key: bool,
+    #[serde(default)]
+    pub captured_model: bool,
+    #[serde(default)]
+    pub previous_model_keys: BTreeMap<String, KeySnapshot>,
+    #[serde(default)]
+    pub model_overlay_version: u32,
+    #[serde(default)]
+    pub parked_catalogs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_last_selected_model: Option<serde_json::Value>,
+    #[serde(default)]
+    pub captured_last_selected_model: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -227,7 +268,19 @@ fn attach_at(home: &Path, backup_file: &Path, next: &str) -> Result<String> {
     let legacy = has_legacy_fwd(&doc);
     let already = live_attached(&raw, &next)?;
     if already && current.as_deref() == Some(next.as_str()) && !legacy {
+        let overlay_version = load_backup_at(backup_file)
+            .map(|item| item.model_overlay_version)
+            .unwrap_or(0);
         ensure_sidecar(home, backup_file, &raw, false)?;
+        refresh_model_snapshot(backup_file, &raw)?;
+        apply_model_surface(home, backup_file)?;
+        if (overlay_version < MODEL_OVERLAY_VERSION && leftover_model_overlay_present(&raw)?)
+            || !kit_catalog_pointer_ok(home, &raw)?
+        {
+            let mut patched = apply_fwd_route(&raw, &next)?;
+            patched = with_kit_catalog_pointer(home, &patched)?;
+            atomic_write_text(&config_path, &patched)?;
+        }
         overlay_kit_onto_official(home)?;
         return Ok("already attached".into());
     }
@@ -236,7 +289,10 @@ fn attach_at(home: &Path, backup_file: &Path, next: &str) -> Result<String> {
     } else {
         ensure_sidecar(home, backup_file, &raw, true)?;
     }
-    let patched = apply_fwd_route(&raw, &next)?;
+    refresh_model_snapshot(backup_file, &raw)?;
+    apply_model_surface(home, backup_file)?;
+    let mut patched = apply_fwd_route(&raw, &next)?;
+    patched = with_kit_catalog_pointer(home, &patched)?;
     atomic_write_text(&config_path, &patched)?;
     overlay_kit_onto_official(home)?;
     Ok(format!("patched Codex openai_base_url -> {next}"))
@@ -252,6 +308,7 @@ fn restore_at(backup_file: &Path, fallback_home: &Path) -> Result<String> {
     let config_path = home.join("config.toml");
     let bak = config_bak_path(&home);
     restore_official_auth(&home)?;
+    restore_model_surface(&home, backup.as_ref())?;
 
     if bak.exists() {
         std::fs::copy(&bak, &config_path)
@@ -304,24 +361,86 @@ fn ensure_sidecar(home: &Path, backup_file: &Path, raw: &str, overwrite: bool) -
     let doc = parse_doc(raw)?;
     let previous_openai = openai_base_url(&doc);
     let previous_provider = active_model_provider(&doc).filter(|id| id != PROVIDER_ID);
-    save_backup_at(
-        backup_file,
-        &Backup {
-            codex_home: home.display().to_string(),
-            previous_openai_base_url: previous_openai,
-            previous_model_provider: previous_provider,
-            provider: None,
-            original_base_url: None,
-            previous_cli_auth_store: cli_auth_credentials_store(&doc),
-            had_cli_auth_store_key: doc.get("cli_auth_credentials_store").is_some(),
-        },
-    )
+    let mut backup = Backup {
+        codex_home: home.display().to_string(),
+        previous_openai_base_url: previous_openai,
+        previous_model_provider: previous_provider,
+        provider: None,
+        original_base_url: None,
+        previous_cli_auth_store: cli_auth_credentials_store(&doc),
+        had_cli_auth_store_key: doc.get("cli_auth_credentials_store").is_some(),
+        previous_model: None,
+        had_model_key: false,
+        captured_model: false,
+        previous_model_keys: BTreeMap::new(),
+        model_overlay_version: 0,
+        parked_catalogs: Vec::new(),
+        previous_last_selected_model: None,
+        captured_last_selected_model: false,
+    };
+    fill_model_snapshot(&mut backup, &doc);
+    save_backup_at(backup_file, &backup)
+}
+
+fn refresh_model_snapshot(backup_file: &Path, raw: &str) -> Result<()> {
+    let Some(mut backup) = load_backup_at(backup_file) else {
+        return Ok(());
+    };
+    if backup.model_overlay_version >= MODEL_OVERLAY_VERSION {
+        return Ok(());
+    }
+    fill_model_snapshot(&mut backup, &parse_doc(raw)?);
+    save_backup_at(backup_file, &backup)
+}
+
+fn fill_model_snapshot(backup: &mut Backup, doc: &DocumentMut) {
+    if backup.model_overlay_version >= MODEL_OVERLAY_VERSION {
+        return;
+    }
+    if !backup.previous_model_keys.contains_key("model")
+        && (backup.captured_model || backup.had_model_key || backup.previous_model.is_some())
+    {
+        backup.previous_model_keys.insert(
+            "model".into(),
+            KeySnapshot {
+                present: backup.had_model_key || backup.previous_model.is_some(),
+                value: backup.previous_model.clone(),
+            },
+        );
+    }
+    for key in MODEL_OVERLAY_KEYS {
+        backup
+            .previous_model_keys
+            .entry((*key).to_string())
+            .or_insert_with(|| snapshot_key(doc, key));
+    }
+    backup.model_overlay_version = MODEL_OVERLAY_VERSION;
+    backup.captured_model = true;
+    if let Some(model) = backup.previous_model_keys.get("model") {
+        backup.had_model_key = model.present;
+        backup.previous_model = model.value.clone();
+    }
+}
+
+fn snapshot_key(doc: &DocumentMut, key: &str) -> KeySnapshot {
+    KeySnapshot {
+        present: doc.get(key).is_some(),
+        value: config_string(doc, key),
+    }
 }
 
 fn apply_fwd_route(config_text: &str, proxy_base_url: &str) -> Result<String> {
     let mut doc = parse_doc(config_text)?;
     doc["openai_base_url"] = toml_edit::value(normalize_base_url(proxy_base_url));
     doc["cli_auth_credentials_store"] = toml_edit::value("file");
+    for key in MODEL_OVERLAY_KEYS {
+        doc.as_table_mut().remove(*key);
+    }
+    if let Some(id) = active_model_provider(&doc) {
+        if id != "openai" {
+            doc.as_table_mut().remove("model_provider");
+        }
+    }
     strip_legacy_fwd(&mut doc);
     Ok(doc.to_string())
 }
@@ -351,7 +470,270 @@ fn remove_fwd_route(config_text: &str, backup: Option<&Backup>) -> Result<String
         }
     }
     restore_cli_auth_store(&mut doc, backup);
+    restore_model_keys(&mut doc, backup);
     Ok(doc.to_string())
+}
+
+fn config_string(doc: &DocumentMut, key: &str) -> Option<String> {
+    doc.get(key)
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn leftover_model_overlay_present(raw: &str) -> Result<bool> {
+    let doc = parse_doc(raw)?;
+    for key in MODEL_OVERLAY_KEYS {
+        if *key == "model_catalog_json" {
+            if let Some(value) = config_string(&doc, key) {
+                if value != KIT_MODEL_CATALOG {
+                    return Ok(true);
+                }
+            }
+            continue;
+        }
+        if doc.get(*key).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn kit_catalog_pointer_ok(home: &Path, raw: &str) -> Result<bool> {
+    if !home.join(KIT_MODEL_CATALOG).exists() {
+        return Ok(true);
+    }
+    Ok(config_string(&parse_doc(raw)?, "model_catalog_json").as_deref() == Some(KIT_MODEL_CATALOG))
+}
+
+fn with_kit_catalog_pointer(home: &Path, config_text: &str) -> Result<String> {
+    if !home.join(KIT_MODEL_CATALOG).exists() {
+        return Ok(config_text.to_string());
+    }
+    let mut doc = parse_doc(config_text)?;
+    doc["model_catalog_json"] = toml_edit::value(KIT_MODEL_CATALOG);
+    Ok(doc.to_string())
+}
+
+fn apply_model_surface(home: &Path, backup_file: &Path) -> Result<()> {
+    let Some(mut backup) = load_backup_at(backup_file) else {
+        return Ok(());
+    };
+    park_custom_catalogs(home, &mut backup)?;
+    write_official_kit_catalog(home)?;
+    overlay_last_selected_model(home, &mut backup)?;
+    save_backup_at(backup_file, &backup)
+}
+
+fn restore_model_surface(home: &Path, backup: Option<&Backup>) -> Result<()> {
+    restore_custom_catalogs(home, backup)?;
+    restore_last_selected_model(home, backup)?;
+    let kit_catalog = home.join(KIT_MODEL_CATALOG);
+    if kit_catalog.exists() {
+        let _ = std::fs::remove_file(&kit_catalog);
+    }
+    Ok(())
+}
+
+fn park_custom_catalogs(home: &Path, backup: &mut Backup) -> Result<()> {
+    let mut names: Vec<String> = CUSTOM_MODEL_CATALOGS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    if let Some(value) = backup
+        .previous_model_keys
+        .get("model_catalog_json")
+        .and_then(|item| item.value.as_deref())
+        .and_then(safe_catalog_name)
+    {
+        if !names.iter().any(|name| name == value) {
+            names.push(value.to_string());
+        }
+    }
+    for name in names {
+        let src = home.join(&name);
+        let bak = home.join(format!("{name}.codex-state-kit.bak"));
+        if src.exists() && !bak.exists() {
+            std::fs::rename(&src, &bak)
+                .with_context(|| format!("park {}", src.display()))?;
+            if !backup.parked_catalogs.iter().any(|item| item == &name) {
+                backup.parked_catalogs.push(name);
+            }
+        } else if bak.exists() {
+            if src.exists() {
+                let _ = std::fs::remove_file(&src);
+            }
+            if !backup.parked_catalogs.iter().any(|item| item == &name) {
+                backup.parked_catalogs.push(name);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn restore_custom_catalogs(home: &Path, backup: Option<&Backup>) -> Result<()> {
+    let Some(backup) = backup else {
+        return Ok(());
+    };
+    for name in &backup.parked_catalogs {
+        let src = home.join(name);
+        let bak = home.join(format!("{name}.codex-state-kit.bak"));
+        if bak.exists() {
+            if src.exists() {
+                let _ = std::fs::remove_file(&src);
+            }
+            std::fs::rename(&bak, &src)
+                .with_context(|| format!("restore {}", src.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn safe_catalog_name(value: &str) -> Option<&str> {
+    let name = value.trim();
+    if name.is_empty() || name.contains("..") || Path::new(name).is_absolute() {
+        return None;
+    }
+    Some(name)
+}
+
+fn write_official_kit_catalog(home: &Path) -> Result<bool> {
+    let cache_path = home.join(OFFICIAL_MODELS_CACHE);
+    let raw = match std::fs::read_to_string(&cache_path) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(false),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let Some(models) = value.get("models").and_then(|item| item.as_array()) else {
+        return Ok(false);
+    };
+    let mapped: Vec<serde_json::Value> = models.iter().filter_map(map_official_catalog_model).collect();
+    if mapped.is_empty() {
+        return Ok(false);
+    }
+    let catalog = serde_json::json!({ "models": mapped });
+    atomic_write_text(
+        &home.join(KIT_MODEL_CATALOG),
+        &serde_json::to_string_pretty(&catalog)?,
+    )?;
+    Ok(true)
+}
+
+fn map_official_catalog_model(model: &serde_json::Value) -> Option<serde_json::Value> {
+    let obj = model.as_object()?;
+    let slug = obj.get("slug")?.as_str()?.trim();
+    if slug.is_empty() {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    for key in [
+        "slug",
+        "display_name",
+        "description",
+        "default_reasoning_level",
+        "supported_reasoning_levels",
+        "additional_speed_tiers",
+        "service_tiers",
+        "visibility",
+        "priority",
+        "shell_type",
+        "supported_in_api",
+        "default_reasoning_summary",
+        "support_verbosity",
+        "default_verbosity",
+        "context_window",
+        "max_context_window",
+        "effective_context_window_percent",
+        "input_modalities",
+        "supports_search_tool",
+        "supports_reasoning_summaries",
+        "supports_image_detail_original",
+        "supports_parallel_tool_calls",
+        "truncation_policy",
+        "upgrade",
+        "availability_nux",
+        "experimental_supported_tools",
+        "base_instructions",
+    ] {
+        if let Some(value) = obj.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    if !out.contains_key("visibility") {
+        out.insert("visibility".into(), serde_json::json!("list"));
+    }
+    if !out.contains_key("base_instructions") {
+        out.insert(
+            "base_instructions".into(),
+            serde_json::json!("You are Codex, a coding agent."),
+        );
+    }
+    Some(serde_json::Value::Object(out))
+}
+
+fn overlay_last_selected_model(home: &Path, backup: &mut Backup) -> Result<()> {
+    let path = home.join(".codex-global-state.json");
+    if !path.exists() {
+        backup.captured_last_selected_model = true;
+        return Ok(());
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(_) => {
+            backup.captured_last_selected_model = true;
+            return Ok(());
+        }
+    };
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        backup.captured_last_selected_model = true;
+        return Ok(());
+    };
+    let Some(atom) = root.get_mut("electron-persisted-atom-state") else {
+        backup.captured_last_selected_model = true;
+        return Ok(());
+    };
+    if !backup.captured_last_selected_model {
+        backup.previous_last_selected_model = atom.get(LAST_SELECTED_ATOM).cloned();
+        backup.captured_last_selected_model = true;
+    }
+    atom[LAST_SELECTED_ATOM] = serde_json::json!({
+        "slug": OFFICIAL_DEFAULT_MODEL,
+        "thinkingEffort": serde_json::Value::Null,
+        "versionId": serde_json::Value::Null
+    });
+    atomic_write_text(&path, &serde_json::to_string(&root)?)
+}
+
+fn restore_last_selected_model(home: &Path, backup: Option<&Backup>) -> Result<()> {
+    let Some(backup) = backup.filter(|item| item.captured_last_selected_model) else {
+        return Ok(());
+    };
+    let path = home.join(".codex-global-state.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&path)?)
+    else {
+        return Ok(());
+    };
+    let Some(atom) = root.get_mut("electron-persisted-atom-state") else {
+        return Ok(());
+    };
+    match &backup.previous_last_selected_model {
+        Some(value) => {
+            atom[LAST_SELECTED_ATOM] = value.clone();
+        }
+        None => {
+            if let Some(object) = atom.as_object_mut() {
+                object.remove(LAST_SELECTED_ATOM);
+            }
+        }
+    }
+    atomic_write_text(&path, &serde_json::to_string(&root)?)
 }
 
 fn cli_auth_credentials_store(doc: &DocumentMut) -> Option<String> {
@@ -360,6 +742,44 @@ fn cli_auth_credentials_store(doc: &DocumentMut) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn restore_model_keys(doc: &mut DocumentMut, backup: Option<&Backup>) {
+    let Some(backup) = backup else {
+        return;
+    };
+    if backup.previous_model_keys.is_empty() && backup.captured_model {
+        match backup
+            .previous_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) if backup.had_model_key => doc["model"] = toml_edit::value(value),
+            _ if backup.had_model_key || backup.captured_model => {
+                doc.as_table_mut().remove("model");
+            }
+            _ => {}
+        }
+        return;
+    }
+    for (key, snap) in &backup.previous_model_keys {
+        if snap.present {
+            match snap
+                .value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(value) => doc[key.as_str()] = toml_edit::value(value),
+                None => {
+                    doc.as_table_mut().remove(key);
+                }
+            }
+        } else {
+            doc.as_table_mut().remove(key);
+        }
+    }
 }
 
 fn restore_cli_auth_store(doc: &mut DocumentMut, backup: Option<&Backup>) {
@@ -627,6 +1047,14 @@ mod tests {
             original_base_url: None,
             previous_cli_auth_store: None,
             had_cli_auth_store_key: false,
+            previous_model: None,
+            had_model_key: false,
+            captured_model: false,
+            previous_model_keys: BTreeMap::new(),
+            model_overlay_version: 0,
+            parked_catalogs: Vec::new(),
+            previous_last_selected_model: None,
+            captured_last_selected_model: false,
         }
     }
 
@@ -726,7 +1154,7 @@ mod tests {
         let out = apply_fwd_route(raw, "http://127.0.0.1:8787").unwrap();
         assert!(out.contains("openai_base_url = \"http://127.0.0.1:8787\""));
         assert!(out.contains("cli_auth_credentials_store = \"file\""));
-        assert!(out.contains("model = \"gpt-6-astra\""));
+        assert!(!out.contains("model ="));
         assert!(!out.contains("model_provider"));
         assert!(!out.contains("[model_providers.codex_state_kit]"));
     }
@@ -752,9 +1180,9 @@ base_url = "https://api.openai.com/v1"
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("codex");
         let backup = root.path().join("backup.json");
-        let original = r#"# keep-me
-model = "gpt-6-astra"
+        let original = r#"model = "gpt-6-astra"
 
+# keep-me
 [mcp_servers.example]
 command = "example"
 "#;
@@ -766,6 +1194,7 @@ command = "example"
         let patched = fs::read_to_string(home.join("config.toml")).unwrap();
         assert!(patched.contains("openai_base_url = \"http://127.0.0.1:8787\""));
         assert!(patched.contains("cli_auth_credentials_store = \"file\""));
+        assert!(!patched.contains("model ="));
         assert!(!patched.contains("model_provider"));
         assert!(!patched.contains("[model_providers.codex_state_kit]"));
         assert!(patched.contains("[mcp_servers.example]"));
@@ -780,6 +1209,16 @@ command = "example"
         let sidecar: Backup = serde_json::from_str(&fs::read_to_string(&backup).unwrap()).unwrap();
         assert!(sidecar.previous_openai_base_url.is_none());
         assert!(sidecar.previous_model_provider.is_none());
+        assert!(sidecar.captured_model);
+        assert!(sidecar.had_model_key);
+        assert_eq!(sidecar.previous_model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(
+            sidecar
+                .previous_model_keys
+                .get("model")
+                .and_then(|item| item.value.as_deref()),
+            Some("gpt-6-astra")
+        );
 
         let restored = restore_at(&backup, &home).unwrap();
         assert!(restored.contains("restored"));
@@ -1057,5 +1496,113 @@ base_url = "http://127.0.0.1:8787"
         assert!(raw.contains("base_url = \"https://api.openai.com/v1\""));
         assert!(raw.contains("model_provider = \"openai\""));
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn attach_maps_official_catalog_with_ultra_and_fast_then_restores() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex");
+        let backup = root.path().join("backup.json");
+        write_config(
+            &home,
+            r#"model = "grok-4.6"
+model_reasoning_effort = "xhigh"
+service_tier = "priority"
+model_catalog_json = "cc-switch-model-catalog.json"
+"#,
+        );
+        write_chatgpt_auth(&home);
+        fs::write(
+            home.join("cc-switch-model-catalog.json"),
+            r#"{"models":[{"slug":"grok-4.6","supported_reasoning_levels":[{"effort":"xhigh"}],"additional_speed_tiers":[],"service_tiers":[]}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join("models_cache.json"),
+            r#"{
+  "models": [
+    {
+      "slug": "gpt-6-astra",
+      "display_name": "GPT-6-Astra",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {"effort": "medium", "description": "balanced"},
+        {"effort": "ultra", "description": "Maximum reasoning with automatic task delegation"}
+      ],
+      "additional_speed_tiers": ["fast"],
+      "service_tiers": [{"id": "priority", "name": "Fast"}],
+      "visibility": "list"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join(".codex-global-state.json"),
+            r#"{"electron-persisted-atom-state":{"chatgpt-last-selected-model-v1":{"slug":"grok-4.6","thinkingEffort":"xhigh","versionId":null}}}"#,
+        )
+        .unwrap();
+
+        attach_at(&home, &backup, "http://127.0.0.1:8787").unwrap();
+        let patched = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(!patched.contains("grok-4.6"));
+        assert!(!patched.contains("model_reasoning_effort"));
+        assert!(!patched.contains("service_tier"));
+        assert!(patched.contains(&format!("model_catalog_json = \"{KIT_MODEL_CATALOG}\"")));
+        assert!(!home.join("cc-switch-model-catalog.json").exists());
+        assert!(home
+            .join("cc-switch-model-catalog.json.codex-state-kit.bak")
+            .exists());
+        let catalog: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(home.join(KIT_MODEL_CATALOG)).unwrap()).unwrap();
+        let astra = catalog["models"][0].clone();
+        assert_eq!(astra["slug"], "gpt-6-astra");
+        let efforts: Vec<&str> = astra["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["effort"].as_str())
+            .collect();
+        assert!(efforts.contains(&"ultra"));
+        assert_eq!(astra["additional_speed_tiers"][0], "fast");
+        assert_eq!(astra["service_tiers"][0]["name"], "Fast");
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".codex-global-state.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            state["electron-persisted-atom-state"][LAST_SELECTED_ATOM]["slug"],
+            OFFICIAL_DEFAULT_MODEL
+        );
+
+        restore_at(&backup, &home).unwrap();
+        let after = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(after.contains("model = \"grok-4.6\""));
+        assert!(after.contains("model_reasoning_effort = \"xhigh\""));
+        assert!(after.contains("service_tier = \"priority\""));
+        assert!(after.contains("model_catalog_json = \"cc-switch-model-catalog.json\""));
+        assert!(home.join("cc-switch-model-catalog.json").exists());
+        assert!(!home.join(KIT_MODEL_CATALOG).exists());
+        let restored_state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".codex-global-state.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            restored_state["electron-persisted-atom-state"][LAST_SELECTED_ATOM]["slug"],
+            "grok-4.6"
+        );
+    }
+
+    #[test]
+    fn apply_fwd_route_strips_local_model_overrides() {
+        let raw = r#"model = "grok-4.6"
+model_reasoning_effort = "xhigh"
+service_tier = "priority"
+model_provider = "cc-switch"
+"#;
+        let out = apply_fwd_route(raw, "http://127.0.0.1:8787").unwrap();
+        assert!(out.contains("openai_base_url = \"http://127.0.0.1:8787\""));
+        assert!(!out.contains("grok-4.6"));
+        assert!(!out.contains("model_reasoning_effort"));
+        assert!(!out.contains("service_tier"));
+        assert!(!out.contains("model_provider"));
     }
 }
