@@ -262,6 +262,21 @@ mod tests {
     }
 
     #[test]
+    fn token_details_identify_manual_proxy() {
+        let details = token_network_details(
+            "https://chatgpt.com/backend-api/codex",
+            "socks5h://proxy.example.test:44445",
+            false,
+            "gpt-6-astra",
+        );
+        assert_eq!(details.route_kind, ROUTE_MANUAL_PROXY);
+        assert_eq!(
+            details.proxy_endpoint.as_deref(),
+            Some("socks5h://proxy.example.test:44445")
+        );
+    }
+
+    #[test]
     fn safe_text_removes_log_controls_and_bounds_input() {
         assert_eq!(safe_text("  gpt-6\nastra\t-extra", 12), "gpt-6astra-e");
     }
