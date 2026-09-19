@@ -2,12 +2,17 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::{SecondsFormat, Utc};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Kit 独立登录文件。接入期间会覆盖官方 `auth.json`，退出时从备份还原。
+pub const KIT_AUTH_FILE: &str = "auth.codex-state-kit.json";
+pub const OFFICIAL_AUTH_BACKUP_FILE: &str = "auth.json.codex-state-kit.bak";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -145,16 +150,96 @@ pub fn http_client() -> Result<reqwest::Client> {
         .context("build login http client")
 }
 
-pub fn login_status(home: &Path) -> LoginStatus {
-    match read_auth(home) {
-        Ok(Some(auth)) => status_from_auth(&auth),
-        _ => LoginStatus {
-            logged_in: false,
-            auth_mode: None,
-            email: None,
-            account_id: None,
-        },
+pub fn kit_auth_path(home: &Path) -> PathBuf {
+    home.join(KIT_AUTH_FILE)
+}
+
+pub fn official_auth_backup_path(home: &Path) -> PathBuf {
+    home.join(OFFICIAL_AUTH_BACKUP_FILE)
+}
+
+fn official_auth_path(home: &Path) -> PathBuf {
+    home.join("auth.json")
+}
+
+/// 首次覆盖前把官方 `auth.json` 备份到同目录，再把 Kit 登录同步过去。
+pub fn overlay_kit_onto_official(home: &Path) -> Result<()> {
+    capture_official_auth_once(home)?;
+    let kit = kit_auth_path(home);
+    if kit.exists() {
+        std::fs::copy(&kit, official_auth_path(home))
+            .with_context(|| format!("sync {}", official_auth_path(home).display()))?;
     }
+    Ok(())
+}
+
+/// 退出 Kit 时还原打开前的官方账号文件。
+pub fn restore_official_auth(home: &Path) -> Result<()> {
+    let bak = official_auth_backup_path(home);
+    if !bak.exists() {
+        return Ok(());
+    }
+    let official = official_auth_path(home);
+    let data = std::fs::read(&bak).with_context(|| format!("read {}", bak.display()))?;
+    if data.is_empty() {
+        let _ = std::fs::remove_file(&official);
+    } else {
+        atomic_write(&official, &data)?;
+    }
+    let _ = std::fs::remove_file(&bak);
+    Ok(())
+}
+
+fn capture_official_auth_once(home: &Path) -> Result<()> {
+    let bak = official_auth_backup_path(home);
+    if bak.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = bak.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let official = official_auth_path(home);
+    match std::fs::read(&official) {
+        Ok(bytes) => {
+            std::fs::write(&bak, bytes).with_context(|| format!("write {}", bak.display()))?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&bak, b"").with_context(|| format!("write {}", bak.display()))?;
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("read {}", official.display()));
+        }
+    }
+    Ok(())
+}
+
+fn empty_login_status() -> LoginStatus {
+    LoginStatus {
+        logged_in: false,
+        auth_mode: None,
+        email: None,
+        account_id: None,
+    }
+}
+
+fn status_from_file(path: &Path) -> LoginStatus {
+    match read_auth_file(path) {
+        Ok(Some(auth)) => status_from_auth(&auth),
+        _ => empty_login_status(),
+    }
+}
+
+/// 优先显示 Kit 独立登录；没有时才回落到官方 auth.json。
+pub fn login_status(home: &Path) -> LoginStatus {
+    let kit = status_from_file(&kit_auth_path(home));
+    if kit.logged_in {
+        return kit;
+    }
+    status_from_file(&official_auth_path(home))
+}
+
+pub fn has_kit_session(home: &Path) -> bool {
+    status_from_file(&kit_auth_path(home)).logged_in
 }
 
 pub fn has_chatgpt_login(home: &Path) -> bool {
@@ -168,20 +253,36 @@ pub(crate) struct ChatGptCredentials {
 }
 
 pub(crate) fn chatgpt_credentials(home: &Path) -> Result<ChatGptCredentials> {
-    if !has_chatgpt_login(home) {
-        bail!("尚未登录 ChatGPT。请先在本应用完成 ChatGPT 登录。");
+    if let Some(creds) = credentials_from_file(&kit_auth_path(home))? {
+        return Ok(creds);
     }
-    let auth = read_auth(home)?.ok_or_else(|| anyhow::anyhow!("缺少 auth.json"))?;
+    if let Some(creds) = credentials_from_file(&official_auth_path(home))? {
+        return Ok(creds);
+    }
+    bail!("尚未登录 ChatGPT。请先在本应用完成 ChatGPT 登录。");
+}
+
+fn credentials_from_file(path: &Path) -> Result<Option<ChatGptCredentials>> {
+    let Some(auth) = read_auth_file(path)? else {
+        return Ok(None);
+    };
+    if !status_from_auth(&auth).logged_in {
+        return Ok(None);
+    }
+    Ok(Some(credentials_from_auth(&auth)?))
+}
+
+fn credentials_from_auth(auth: &Value) -> Result<ChatGptCredentials> {
     let tokens = auth
         .get("tokens")
         .and_then(Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("auth.json 缺少 tokens"))?;
+        .ok_or_else(|| anyhow::anyhow!("登录文件缺少 tokens"))?;
     let access_token = tokens
         .get("access_token")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("auth.json 缺少 access_token"))?
+        .ok_or_else(|| anyhow::anyhow!("登录文件缺少 access_token"))?
         .to_string();
     let stored_account = tokens
         .get("account_id")
@@ -193,11 +294,28 @@ pub(crate) fn chatgpt_credentials(home: &Path) -> Result<ChatGptCredentials> {
     let (jwt_account, _) = extract_account_metadata(id_token, &access_token);
     let account_id = jwt_account
         .or(stored_account)
-        .ok_or_else(|| anyhow::anyhow!("无法从 auth.json 提取 chatgpt_account_id"))?;
+        .ok_or_else(|| anyhow::anyhow!("无法从登录文件提取 chatgpt_account_id"))?;
     Ok(ChatGptCredentials {
         access_token,
         account_id,
     })
+}
+
+/// Kit 已独立登录时，用 Kit 账号替换转发请求上的鉴权头，官方客户端无需重启。
+pub fn apply_kit_auth_headers(headers: &mut HeaderMap, home: &Path) {
+    if !has_kit_session(home) {
+        return;
+    }
+    let Ok(creds) = chatgpt_credentials(home) else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", creds.access_token)) {
+        headers.insert(http::header::AUTHORIZATION, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&creds.account_id) {
+        headers.insert(HeaderName::from_static("chatgpt-account-id"), value);
+    }
+    headers.remove(http::header::COOKIE);
 }
 
 pub async fn start_device_login(
@@ -313,7 +431,7 @@ pub async fn poll_device_login(
     match exchange_and_write(client, endpoints, &success, pending).await {
         Ok(login) => Ok(PollResult {
             status: PollStatus::Ok,
-            message: Some("已写入 Codex auth.json".into()),
+            message: Some("已保存并同步到 Codex 账号".into()),
             login: Some(login),
         }),
         Err(err) => Ok(PollResult {
@@ -397,13 +515,14 @@ pub(crate) fn persist_tokens(home: &Path, tokens: &OAuthTokenResponse) -> Result
     let (account_id, email) = extract_account_metadata(id_token, &tokens.access_token);
     let account_id =
         account_id.ok_or_else(|| anyhow::anyhow!("无法从 token 中提取 chatgpt_account_id"))?;
-    write_auth_json(
+    write_session_auth(
         home,
         id_token,
         &tokens.access_token,
         refresh_token,
         &account_id,
     )?;
+    overlay_kit_onto_official(home)?;
     Ok(LoginStatus {
         logged_in: true,
         auth_mode: Some("chatgpt".into()),
@@ -412,26 +531,76 @@ pub(crate) fn persist_tokens(home: &Path, tokens: &OAuthTokenResponse) -> Result
     })
 }
 
-fn write_auth_json(
+fn write_session_auth(
     home: &Path,
     id_token: &str,
     access_token: &str,
     refresh_token: &str,
     account_id: &str,
 ) -> Result<()> {
-    std::fs::create_dir_all(home).with_context(|| format!("create {}", home.display()))?;
-    let auth = json!({
-        "auth_mode": "chatgpt",
-        "OPENAI_API_KEY": null,
-        "tokens": {
-            "id_token": id_token,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "account_id": account_id,
-        },
-        "last_refresh": Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-    });
-    atomic_write(&auth_path(home), &serde_json::to_vec_pretty(&auth)?)
+    write_auth_json(
+        &kit_auth_path(home),
+        id_token,
+        access_token,
+        refresh_token,
+        account_id,
+    )
+}
+
+fn write_auth_json(
+    path: &Path,
+    id_token: &str,
+    access_token: &str,
+    refresh_token: &str,
+    account_id: &str,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let mut auth = match read_auth_file(path)? {
+        Some(Value::Object(map)) => Value::Object(map),
+        _ => json!({}),
+    };
+
+    let previous_account = auth
+        .get("tokens")
+        .and_then(Value::as_object)
+        .and_then(|tokens| tokens.get("account_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let account_changed = previous_account.as_deref() != Some(account_id);
+
+    let obj = auth
+        .as_object_mut()
+        .expect("auth.json root must be an object");
+    obj.insert("auth_mode".into(), json!("chatgpt"));
+    obj.insert("OPENAI_API_KEY".into(), Value::Null);
+    obj.insert(
+        "last_refresh".into(),
+        json!(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)),
+    );
+    if account_changed {
+        // 官方桌面端会在 auth.json 里写入 agent_identity 等账号专属字段，切号后必须丢掉
+        obj.remove("agent_identity");
+    }
+
+    let mut tokens = if account_changed {
+        serde_json::Map::new()
+    } else {
+        obj.get("tokens")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    };
+    tokens.insert("id_token".into(), json!(id_token));
+    tokens.insert("access_token".into(), json!(access_token));
+    tokens.insert("refresh_token".into(), json!(refresh_token));
+    tokens.insert("account_id".into(), json!(account_id));
+    obj.insert("tokens".into(), Value::Object(tokens));
+
+    atomic_write(path, &serde_json::to_vec_pretty(&auth)?)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -446,17 +615,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn auth_path(home: &Path) -> PathBuf {
-    home.join("auth.json")
-}
-
-fn read_auth(home: &Path) -> Result<Option<Value>> {
-    let path = auth_path(home);
+fn read_auth_file(path: &Path) -> Result<Option<Value>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let value: Value = serde_json::from_str(&raw).context("parse auth.json")?;
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let value: Value = serde_json::from_str(&raw).context("parse auth file")?;
     Ok(Some(value))
 }
 
@@ -596,6 +760,7 @@ fn is_access_denied(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::{HeaderMap, HeaderValue};
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
@@ -703,6 +868,7 @@ mod tests {
         pending.cancel();
         assert!(poll_device_login(&client, &endpoints, &pending).await.is_err());
         assert!(!home.path().join("auth.json").exists());
+        assert!(!kit_auth_path(home.path()).exists());
     }
 
     #[tokio::test]
@@ -718,6 +884,7 @@ mod tests {
             .unwrap();
         assert_eq!(poll.status, PollStatus::Pending);
         assert!(!home.path().join("auth.json").exists());
+        assert!(!kit_auth_path(home.path()).exists());
     }
 
     #[tokio::test]
@@ -737,7 +904,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.status, PollStatus::Ok);
-        let raw = std::fs::read_to_string(home.path().join("auth.json")).unwrap();
+        let raw = std::fs::read_to_string(kit_auth_path(home.path())).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("auth.json")).unwrap(),
+            raw
+        );
+        assert_eq!(
+            std::fs::metadata(official_auth_backup_path(home.path()))
+                .unwrap()
+                .len(),
+            0
+        );
         let value: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["auth_mode"], "chatgpt");
         assert!(value.get("OPENAI_API_KEY").unwrap().is_null());
@@ -773,6 +950,7 @@ mod tests {
             .unwrap();
         assert_eq!(poll.status, PollStatus::Failed);
         assert!(!home.path().join("auth.json").exists());
+        assert!(!kit_auth_path(home.path()).exists());
     }
 
     #[test]
@@ -809,5 +987,165 @@ mod tests {
         assert!(!status.logged_in);
         let encoded = serde_json::to_value(&status).unwrap();
         assert!(encoded.get("OPENAI_API_KEY").is_none());
+    }
+
+    #[test]
+    fn write_session_auth_merges_extra_fields_without_touching_official() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("auth.json"), r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official","refresh_token":"keep","account_id":"official-acct"}}"#).unwrap();
+        std::fs::write(
+            kit_auth_path(home.path()),
+            r#"{
+  "auth_mode": "chatgpt",
+  "agent_identity": "keep-me",
+  "tokens": {
+    "id_token": "old-id",
+    "access_token": "old-access",
+    "refresh_token": "old-refresh",
+    "account_id": "acct-1",
+    "extra_flag": true
+  }
+}"#,
+        )
+        .unwrap();
+        write_session_auth(
+            home.path(),
+            "new-id",
+            "new-access",
+            "new-refresh",
+            "acct-1",
+        )
+        .unwrap();
+        let official = std::fs::read_to_string(home.path().join("auth.json")).unwrap();
+        assert!(official.contains("official-acct"));
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(kit_auth_path(home.path())).unwrap())
+                .unwrap();
+        assert_eq!(value["agent_identity"], "keep-me");
+        assert_eq!(value["tokens"]["extra_flag"], true);
+        assert_eq!(value["tokens"]["access_token"], "new-access");
+        assert_eq!(value["tokens"]["account_id"], "acct-1");
+    }
+
+    fn fake_id_token(account: &str) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(format!(
+            r#"{{"chatgpt_account_id":"{account}","email":"user@example.com"}}"#
+        ));
+        format!("hdr.{payload}.sig")
+    }
+
+    #[test]
+    fn persist_tokens_overlays_official_and_restore_brings_it_back() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official","refresh_token":"keep","account_id":"official-acct"}}"#,
+        )
+        .unwrap();
+        persist_tokens(
+            home.path(),
+            &OAuthTokenResponse {
+                access_token: "kit-access".into(),
+                refresh_token: Some("kit-refresh".into()),
+                id_token: Some(fake_id_token("kit-acct")),
+            },
+        )
+        .unwrap();
+        let official = std::fs::read_to_string(home.path().join("auth.json")).unwrap();
+        assert!(official.contains("kit-acct"));
+        assert!(!official.contains("official-acct"));
+        let bak = std::fs::read_to_string(official_auth_backup_path(home.path())).unwrap();
+        assert!(bak.contains("official-acct"));
+        restore_official_auth(home.path()).unwrap();
+        let restored = std::fs::read_to_string(home.path().join("auth.json")).unwrap();
+        assert!(restored.contains("official-acct"));
+        assert!(!official_auth_backup_path(home.path()).exists());
+    }
+
+    #[test]
+    fn write_session_auth_drops_old_account_identity() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            kit_auth_path(home.path()),
+            r#"{
+  "auth_mode": "chatgpt",
+  "agent_identity": "old-account-identity",
+  "tokens": {
+    "id_token": "old-id",
+    "access_token": "old-access",
+    "refresh_token": "old-refresh",
+    "account_id": "acct-old",
+    "extra_flag": true
+  }
+}"#,
+        )
+        .unwrap();
+        write_session_auth(
+            home.path(),
+            "new-id",
+            "new-access",
+            "new-refresh",
+            "acct-new",
+        )
+        .unwrap();
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(kit_auth_path(home.path())).unwrap())
+                .unwrap();
+        assert!(value.get("agent_identity").is_none());
+        assert!(value["tokens"].get("extra_flag").is_none());
+        assert_eq!(value["tokens"]["account_id"], "acct-new");
+        assert_eq!(value["tokens"]["access_token"], "new-access");
+    }
+
+    #[test]
+    fn kit_session_overrides_official_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("auth.json"),
+            r#"{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "id_token": "a.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJvZmZpY2lhbCJ9.sig",
+    "access_token": "official-access",
+    "refresh_token": "official-refresh",
+    "account_id": "official"
+  }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            kit_auth_path(home.path()),
+            r#"{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "id_token": "a.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJraXQifQ.sig",
+    "access_token": "kit-access",
+    "refresh_token": "kit-refresh",
+    "account_id": "kit"
+  }
+}"#,
+        )
+        .unwrap();
+        let creds = chatgpt_credentials(home.path()).unwrap();
+        assert_eq!(creds.access_token, "kit-access");
+        assert_eq!(creds.account_id, "kit");
+        assert_eq!(login_status(home.path()).account_id.as_deref(), Some("kit"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer official-access"),
+        );
+        headers.insert(http::header::COOKIE, HeaderValue::from_static("session=old"));
+        apply_kit_auth_headers(&mut headers, home.path());
+        assert_eq!(
+            headers.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer kit-access"
+        );
+        assert_eq!(
+            headers.get("chatgpt-account-id").unwrap(),
+            "kit"
+        );
+        assert!(headers.get(http::header::COOKIE).is_none());
     }
 }

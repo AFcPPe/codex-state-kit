@@ -129,7 +129,21 @@ impl App {
         })
     }
 
+    async fn sync_logged_in_account(&self) {
+        let home = self.settings.lock().await.codex_home.clone();
+        let Ok(creds) = login::chatgpt_credentials(Path::new(&home)) else {
+            return;
+        };
+        let changed = self.turn_state.lock().await.bind_account(&creds.account_id);
+        if changed {
+            self.seeds_registered.store(false, Ordering::Relaxed);
+            *self.fetch_error.lock().await = None;
+            self.model_notify.notify_one();
+        }
+    }
+
     pub async fn status(&self) -> Status {
+        self.sync_logged_in_account().await;
         let settings = self.settings.lock().await.clone();
         let logs = self.logs.lock().await.iter().cloned().collect();
         let attached = is_attached(
@@ -274,6 +288,7 @@ impl App {
             *self.fetch_error.lock().await = Some("尚未登录 ChatGPT".into());
             return Duration::from_secs(30);
         }
+        self.sync_logged_in_account().await;
 
         // 首次运行：注册 settings.models 中的种子模型
         if !self.seeds_registered.swap(true, Ordering::Relaxed) {
@@ -858,6 +873,8 @@ async fn forward_http(app: &App, req: Request<Body>) -> Result<Response> {
             );
         }
     }
+    let home = app.settings.lock().await.codex_home.clone();
+    login::apply_kit_auth_headers(&mut parts.headers, Path::new(&home));
     let mut builder = app
         .http
         .request(

@@ -1,6 +1,6 @@
 //! Loopback OAuth authorization-code login, following openai/codex's protocol.
 use crate::login::{
-    exchange_tokens, persist_tokens, LoginMethod, LoginStart, PollResult, PollStatus, CLIENT_ID,
+    exchange_tokens, persist_tokens, kit_auth_path, LoginMethod, LoginStart, PollResult, PollStatus, CLIENT_ID,
 };
 use anyhow::{bail, Context, Result};
 use axum::{
@@ -371,8 +371,12 @@ mod tests {
         assert_eq!(response.headers()["cache-control"], "no-store");
         assert!(!response.text().await.unwrap().contains("test-access"));
         let auth: Value =
-            serde_json::from_slice(&std::fs::read(f.home.path().join("auth.json")).unwrap())
+            serde_json::from_slice(&std::fs::read(kit_auth_path(f.home.path())).unwrap())
                 .unwrap();
+        assert_eq!(
+            std::fs::read(f.home.path().join("auth.json")).unwrap(),
+            std::fs::read(kit_auth_path(f.home.path())).unwrap()
+        );
         assert_eq!(auth["auth_mode"], "chatgpt");
         assert_eq!(auth["tokens"]["account_id"], "account-test");
         let url = url::Url::parse(&f.start.verification_uri).unwrap();

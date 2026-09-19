@@ -107,6 +107,9 @@ struct PersistedStore {
     /// 每个模型最近一轮 fetch 的 token 长度分布
     #[serde(default)]
     distributions: HashMap<String, Vec<TokenLenCount>>,
+    /// 当前 Token 池所属的 ChatGPT account_id
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
 const PERSIST_VERSION: u32 = 2;
@@ -127,6 +130,8 @@ pub struct TurnStateStore {
     model_bound_lens: HashMap<String, usize>,
     /// 每个模型最近一轮 fetch 的 token 长度分布
     distributions: HashMap<String, Vec<TokenLenCount>>,
+    /// 当前 Token 池所属的 ChatGPT account_id
+    account_id: Option<String>,
 }
 
 impl Default for TurnStateStore {
@@ -138,6 +143,7 @@ impl Default for TurnStateStore {
             bound_token_len: None,
             model_bound_lens: HashMap::new(),
             distributions: HashMap::new(),
+            account_id: None,
         }
     }
 }
@@ -221,6 +227,7 @@ impl TurnStateStore {
                     bound_token_len: bound,
                     model_bound_lens: mbl,
                     distributions: dist,
+                    account_id: store.account_id,
                 };
             }
         }
@@ -253,6 +260,7 @@ impl TurnStateStore {
                     bound_token_len: None,
                     model_bound_lens: HashMap::new(),
                     distributions: HashMap::new(),
+                    account_id: None,
                 };
             }
         }
@@ -272,6 +280,7 @@ impl TurnStateStore {
                     bound_token_len: None,
                     model_bound_lens: HashMap::new(),
                     distributions: HashMap::new(),
+                    account_id: None,
                 };
             }
         }
@@ -291,6 +300,7 @@ impl TurnStateStore {
             model_bound_lens: self.model_bound_lens.clone(),
             pool: self.pool.clone(),
             distributions: self.distributions.clone(),
+            account_id: self.account_id.clone(),
         };
         if let Ok(raw) = serde_json::to_string_pretty(&store) {
             let _ = std::fs::write(&path, raw);
@@ -462,6 +472,36 @@ impl TurnStateStore {
         self.tokens.remove(model);
         self.pool.remove(model);
         self.persist();
+    }
+
+    /// 绑定当前 ChatGPT 账号。账号变化时清空旧 Token、模型追踪和分布。
+    /// 返回 true 表示发生了账号切换（或首次从无账号升级到有账号且已有残留）。
+    pub fn bind_account(&mut self, account_id: &str) -> bool {
+        let account_id = account_id.trim();
+        if account_id.is_empty() {
+            return false;
+        }
+        if self.account_id.as_deref() == Some(account_id) {
+            return false;
+        }
+        let had_leftovers = self.account_id.is_some()
+            || !self.tokens.is_empty()
+            || !self.pool.is_empty()
+            || !self.active_models.is_empty();
+        if had_leftovers {
+            eprintln!(
+                "[account] 账号从 {:?} 切换到 {}，清空旧 Token 与模型追踪",
+                self.account_id, account_id
+            );
+            self.tokens.clear();
+            self.pool.clear();
+            self.active_models.clear();
+            self.distributions.clear();
+            self.model_bound_lens.clear();
+        }
+        self.account_id = Some(account_id.to_string());
+        self.persist();
+        had_leftovers
     }
 
     /// 将 token 存入缓存池（不管长度是否匹配绑定）。
@@ -1089,6 +1129,30 @@ mod tests {
     }
 
     #[test]
+    fn bind_account_clears_leftovers_on_switch() {
+        let mut store = TurnStateStore::default();
+        let token = token_for(now_unix() - 30);
+        store.register_model("gpt-6-astra");
+        store.capture("gpt-6-astra", &token, "fetch");
+        store.record_distribution(
+            "gpt-6-astra",
+            vec![TokenLenCount { len: 292, count: 1 }],
+        );
+
+        assert!(store.bind_account("acct-a"));
+        assert_eq!(store.fresh_count(), 0);
+        assert!(store.all_active_models().is_empty());
+        assert!(store.get_distribution("gpt-6-astra").is_empty());
+        assert!(!store.bind_account("acct-a"));
+
+        store.register_model("gpt-6-astra");
+        store.capture("gpt-6-astra", &token, "fetch");
+        assert!(store.bind_account("acct-b"));
+        assert_eq!(store.fresh_count(), 0);
+        assert!(store.all_active_models().is_empty());
+    }
+
+    #[test]
     fn rejects_312_token() {
         let mut store = TurnStateStore::default();
         let degraded = "a".repeat(312);
@@ -1220,6 +1284,7 @@ mod tests {
             model_bound_lens: store.model_bound_lens.clone(),
             pool: store.pool.clone(),
             distributions: store.distributions.clone(),
+            account_id: store.account_id.clone(),
         };
         let json = serde_json::to_string(&persisted).unwrap();
         let restored: PersistedStore = serde_json::from_str(&json).unwrap();

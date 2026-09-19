@@ -394,7 +394,7 @@ export default function App() {
             )}
           </div>
           <p className="panel__hint">
-            启动后自动接入，关闭时自动恢复原路由。未登录时，登录后即可自动接入。
+            启动后自动接入。运行期间把 Kit 账号同步到 Codex 窗口和用量；关闭时还原原来的官方账号和路由。若用量窗口还没刷新，重开一次 Codex 即可。
           </p>
         </section>
           <label className="field connection-directory">

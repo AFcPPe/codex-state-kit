@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table};
 use url::Url;
 
-use crate::login::has_chatgpt_login;
+use crate::login::{has_chatgpt_login, overlay_kit_onto_official, restore_official_auth};
 use crate::settings::{home_dir, Settings};
 
 pub const PROVIDER_ID: &str = "codex_state_kit";
@@ -20,6 +20,10 @@ pub struct Backup {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_base_url: Option<String>,
+    #[serde(default)]
+    pub previous_cli_auth_store: Option<String>,
+    #[serde(default)]
+    pub had_cli_auth_store_key: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -224,6 +228,7 @@ fn attach_at(home: &Path, backup_file: &Path, next: &str) -> Result<String> {
     let already = live_attached(&raw, &next)?;
     if already && current.as_deref() == Some(next.as_str()) && !legacy {
         ensure_sidecar(home, backup_file, &raw, false)?;
+        overlay_kit_onto_official(home)?;
         return Ok("already attached".into());
     }
     if takeover_present(&raw) {
@@ -233,6 +238,7 @@ fn attach_at(home: &Path, backup_file: &Path, next: &str) -> Result<String> {
     }
     let patched = apply_fwd_route(&raw, &next)?;
     atomic_write_text(&config_path, &patched)?;
+    overlay_kit_onto_official(home)?;
     Ok(format!("patched Codex openai_base_url -> {next}"))
 }
 
@@ -245,6 +251,7 @@ fn restore_at(backup_file: &Path, fallback_home: &Path) -> Result<String> {
         .unwrap_or_else(|| fallback_home.to_path_buf());
     let config_path = home.join("config.toml");
     let bak = config_bak_path(&home);
+    restore_official_auth(&home)?;
 
     if bak.exists() {
         std::fs::copy(&bak, &config_path)
@@ -273,11 +280,7 @@ fn restore_at(backup_file: &Path, fallback_home: &Path) -> Result<String> {
                 .filter(|value| !value.is_empty()),
         ) {
             let mut patched = set_provider_base_url(&raw, provider, original)?;
-            patched = remove_fwd_route(
-                &patched,
-                effective_previous_openai(backup).as_deref(),
-                effective_previous_provider(backup).as_deref(),
-            )?;
+            patched = remove_fwd_route(&patched, Some(backup))?;
             atomic_write_text(&config_path, &patched)?;
             clear_backup_at(backup_file);
             return Ok(format!("restored `{provider}` base_url -> {original}"));
@@ -288,13 +291,7 @@ fn restore_at(backup_file: &Path, fallback_home: &Path) -> Result<String> {
         return Ok("nothing to restore".into());
     }
 
-    let previous_openai = backup.as_ref().and_then(effective_previous_openai);
-    let previous_provider = backup.as_ref().and_then(effective_previous_provider);
-    let patched = remove_fwd_route(
-        &raw,
-        previous_openai.as_deref(),
-        previous_provider.as_deref(),
-    )?;
+    let patched = remove_fwd_route(&raw, backup.as_ref())?;
     atomic_write_text(&config_path, &patched)?;
     clear_backup_at(backup_file);
     Ok(format!("restored {}", config_path.display()))
@@ -315,6 +312,8 @@ fn ensure_sidecar(home: &Path, backup_file: &Path, raw: &str, overwrite: bool) -
             previous_model_provider: previous_provider,
             provider: None,
             original_base_url: None,
+            previous_cli_auth_store: cli_auth_credentials_store(&doc),
+            had_cli_auth_store_key: doc.get("cli_auth_credentials_store").is_some(),
         },
     )
 }
@@ -322,17 +321,16 @@ fn ensure_sidecar(home: &Path, backup_file: &Path, raw: &str, overwrite: bool) -
 fn apply_fwd_route(config_text: &str, proxy_base_url: &str) -> Result<String> {
     let mut doc = parse_doc(config_text)?;
     doc["openai_base_url"] = toml_edit::value(normalize_base_url(proxy_base_url));
+    doc["cli_auth_credentials_store"] = toml_edit::value("file");
     strip_legacy_fwd(&mut doc);
     Ok(doc.to_string())
 }
 
-fn remove_fwd_route(
-    config_text: &str,
-    previous_openai: Option<&str>,
-    previous_provider: Option<&str>,
-) -> Result<String> {
+fn remove_fwd_route(config_text: &str, backup: Option<&Backup>) -> Result<String> {
     let mut doc = parse_doc(config_text)?;
-    match previous_openai
+    match backup
+        .and_then(effective_previous_openai)
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
@@ -343,14 +341,46 @@ fn remove_fwd_route(
     }
     strip_legacy_fwd(&mut doc);
     if active_model_provider(&doc).is_none() {
-        if let Some(id) = previous_provider
+        if let Some(id) = backup
+            .and_then(effective_previous_provider)
+            .as_deref()
             .map(str::trim)
             .filter(|id| !id.is_empty() && *id != PROVIDER_ID)
         {
             doc["model_provider"] = toml_edit::value(id);
         }
     }
+    restore_cli_auth_store(&mut doc, backup);
     Ok(doc.to_string())
+}
+
+fn cli_auth_credentials_store(doc: &DocumentMut) -> Option<String> {
+    doc.get("cli_auth_credentials_store")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn restore_cli_auth_store(doc: &mut DocumentMut, backup: Option<&Backup>) {
+    match backup {
+        Some(item) if item.had_cli_auth_store_key => {
+            match item
+                .previous_cli_auth_store
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(value) => doc["cli_auth_credentials_store"] = toml_edit::value(value),
+                None => {
+                    doc.as_table_mut().remove("cli_auth_credentials_store");
+                }
+            }
+        }
+        _ => {
+            doc.as_table_mut().remove("cli_auth_credentials_store");
+        }
+    }
 }
 
 fn strip_legacy_fwd(doc: &mut DocumentMut) {
@@ -595,6 +625,8 @@ mod tests {
             previous_model_provider: None,
             provider: None,
             original_base_url: None,
+            previous_cli_auth_store: None,
+            had_cli_auth_store_key: false,
         }
     }
 
@@ -693,6 +725,7 @@ mod tests {
         let raw = "model = \"gpt-6-astra\"\n";
         let out = apply_fwd_route(raw, "http://127.0.0.1:8787").unwrap();
         assert!(out.contains("openai_base_url = \"http://127.0.0.1:8787\""));
+        assert!(out.contains("cli_auth_credentials_store = \"file\""));
         assert!(out.contains("model = \"gpt-6-astra\""));
         assert!(!out.contains("model_provider"));
         assert!(!out.contains("[model_providers.codex_state_kit]"));
@@ -732,6 +765,7 @@ command = "example"
         assert!(msg.contains("patched Codex openai_base_url"));
         let patched = fs::read_to_string(home.join("config.toml")).unwrap();
         assert!(patched.contains("openai_base_url = \"http://127.0.0.1:8787\""));
+        assert!(patched.contains("cli_auth_credentials_store = \"file\""));
         assert!(!patched.contains("model_provider"));
         assert!(!patched.contains("[model_providers.codex_state_kit]"));
         assert!(patched.contains("[mcp_servers.example]"));
@@ -751,12 +785,53 @@ command = "example"
         assert!(restored.contains("restored"));
         let after = fs::read_to_string(home.join("config.toml")).unwrap();
         assert!(!after.contains("openai_base_url"));
+        assert!(!after.contains("cli_auth_credentials_store"));
         assert!(!after.contains("model_provider"));
         assert!(!after.contains("[model_providers.codex_state_kit]"));
         assert!(after.contains("[mcp_servers.example]"));
         assert!(after.contains("model = \"gpt-6-astra\""));
         assert!(!backup.exists());
         assert!(!is_attached(&home, "http://127.0.0.1:8787"));
+    }
+
+    #[test]
+    fn attach_overlays_kit_account_and_restore_brings_official_back() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex");
+        let backup = root.path().join("backup.json");
+        write_config(
+            &home,
+            "model = \"gpt-6-astra\"\ncli_auth_credentials_store = \"keyring\"\n",
+        );
+        fs::write(
+            home.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official","refresh_token":"keep","account_id":"official-acct"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            crate::login::kit_auth_path(&home),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"kit","refresh_token":"kit-refresh","account_id":"kit-acct"}}"#,
+        )
+        .unwrap();
+
+        attach_at(&home, &backup, "http://127.0.0.1:8787").unwrap();
+        let official = fs::read_to_string(home.join("auth.json")).unwrap();
+        assert!(official.contains("kit-acct"));
+        assert!(!official.contains("official-acct"));
+        let patched = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(patched.contains("cli_auth_credentials_store = \"file\""));
+        let sidecar: Backup = serde_json::from_str(&fs::read_to_string(&backup).unwrap()).unwrap();
+        assert!(sidecar.had_cli_auth_store_key);
+        assert_eq!(sidecar.previous_cli_auth_store.as_deref(), Some("keyring"));
+
+        restore_at(&backup, &home).unwrap();
+        let restored = fs::read_to_string(home.join("auth.json")).unwrap();
+        assert!(restored.contains("official-acct"));
+        assert!(!restored.contains("kit-acct"));
+        assert!(!crate::login::official_auth_backup_path(&home).exists());
+        let after = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(after.contains("cli_auth_credentials_store = \"keyring\""));
+        assert!(!after.contains("openai_base_url"));
     }
 
     #[test]
@@ -787,6 +862,7 @@ command = "example"
         assert!(after.contains("model_provider = \"openai\""));
         assert!(after.contains("[model_providers.openai]"));
         assert!(!after.contains("openai_base_url"));
+        assert!(!after.contains("cli_auth_credentials_store"));
         assert!(!after.contains("[model_providers.codex_state_kit]"));
         assert!(after.contains("[mcp_servers.example]"));
     }
