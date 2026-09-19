@@ -150,7 +150,10 @@ export default function App() {
   const turn = fwd.status.turnState;
   const token = tokenChip(turn);
   const degrade = degradeChip(fwd.status);
-  const copy = tokenCopy(turn, fwd.status.outboundMode === "warp" && fwd.status.warp.phase !== "connected" ? null : fwd.status.fetchError);
+  const copy = tokenCopy(
+    turn,
+    fwd.status.fetchError ?? (fwd.status.outboundMode === "warp" ? fwd.status.warp.error : null),
+  );
   const age = formatAge(turn?.ageSecs);
   const sourceLabel =
     turn?.source === "fetch" ? "StateKit 获取" : turn?.source === "ws" ? "WebSocket" : turn?.source === "http" ? "HTTP" : null;

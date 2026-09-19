@@ -91,19 +91,20 @@ impl WarpRuntime {
 
     pub fn proxy_url(&self) -> Result<String> {
         let view = self.status();
-        if view.phase != "connected" {
-            bail!(
-                "{}",
-                view.error
-                    .unwrap_or_else(|| "内置 WARP 正在自动连接，请稍候。".into())
-            );
-        }
-        self.inner
+        if let Some(endpoint) = self
+            .inner
             .lock()
             .expect("warp state")
             .endpoint
             .clone()
-            .context("WARP 本地代理未就绪")
+        {
+            return Ok(endpoint);
+        }
+        bail!(
+            "{}",
+            view.error
+                .unwrap_or_else(|| "内置 WARP 正在自动连接，请稍候。".into())
+        )
     }
 
     pub async fn connect(&self, accept_terms: bool, http2: bool) -> Result<WarpStatus> {
@@ -231,7 +232,7 @@ impl WarpRuntime {
         }
         let client = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all(&endpoint)?)
-            .timeout(Duration::from_secs(4))
+            .timeout(Duration::from_secs(8))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -240,25 +241,15 @@ impl WarpRuntime {
                 bail!("WARP 内核启动失败，请查看应用数据目录 warp/warp.log。");
             }
             // Listening alone is not a connected tunnel. Verify the actual route.
-            if let Ok(response) = client
-                .get("https://www.cloudflare.com/cdn-cgi/trace")
-                .send()
-                .await
-            {
-                if response.status().is_success() {
-                    if let Ok(body) = response.text().await {
-                        if let Some((ip, country)) = parse_trace(&body) {
-                            let mut inner = self.inner.lock().expect("warp state");
-                            inner.endpoint = Some(endpoint);
-                            inner.view.phase = "connected".into();
-                            inner.view.proxy_url = Some(format!("socks5h://127.0.0.1:{port}"));
-                            inner.view.exit_ip = Some(ip);
-                            inner.view.country = country;
-                            inner.view.error = None;
-                            return Ok(());
-                        }
-                    }
-                }
+            if let Some((ip, country)) = probe_warp_exit(&client).await {
+                let mut inner = self.inner.lock().expect("warp state");
+                inner.endpoint = Some(endpoint);
+                inner.view.phase = "connected".into();
+                inner.view.proxy_url = Some(format!("socks5h://127.0.0.1:{port}"));
+                inner.view.exit_ip = Some(ip);
+                inner.view.country = country;
+                inner.view.error = None;
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 bail!("WARP 隧道未通过连通性检查。可切换 TCP 兼容模式重试，或使用手动代理。");
@@ -287,17 +278,12 @@ impl WarpRuntime {
         let probe: Result<(String, Option<String>)> = async {
             let client = reqwest::Client::builder()
                 .proxy(reqwest::Proxy::all(&endpoint)?)
-                .timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(8))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?;
-            let body = client
-                .get("https://www.cloudflare.com/cdn-cgi/trace")
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await?;
-            parse_trace(&body).context("WARP 出口未通过校验")
+            probe_warp_exit(&client)
+                .await
+                .context("WARP 出口未通过校验")
         }
         .await;
         let mut inner = self.inner.lock().expect("warp state");
@@ -346,6 +332,27 @@ fn validate_config(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn probe_warp_exit(client: &reqwest::Client) -> Option<(String, Option<String>)> {
+    for url in [
+        "https://1.1.1.1/cdn-cgi/trace",
+        "https://www.cloudflare.com/cdn-cgi/trace",
+    ] {
+        let Ok(response) = client.get(url).send().await else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(body) = response.text().await else {
+            continue;
+        };
+        if let Some(parsed) = parse_trace(&body) {
+            return Some(parsed);
+        }
+    }
+    None
 }
 
 fn parse_trace(body: &str) -> Option<(String, Option<String>)> {
