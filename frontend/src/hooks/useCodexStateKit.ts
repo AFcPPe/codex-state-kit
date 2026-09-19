@@ -225,7 +225,7 @@ export function useCodexStateKit() {
     try {
       const next = await setBoundTokenLen(len);
       setStatus(next);
-      setBanner({ kind: "ok", text: len ? `已全局绑定 ${len} Token` : "已恢复默认全局绑定 292" });
+      setBanner({ kind: "ok", text: len ? `已全局绑定 ${len} Token` : "已恢复账号默认绑定" });
     } catch (cause) {
       setBanner({ kind: "error", text: errorMessage(cause) });
     }

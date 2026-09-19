@@ -55,9 +55,10 @@ function modelSummary(view?: TurnStateView | null): string {
 }
 
 function tokenCopy(view?: TurnStateView | null, fetchError?: string | null) {
+  const bound = view?.boundTokenLen ?? 292;
   if (fetchError && (!view || (view.status !== "active" && view.status !== "idle"))) {
     return {
-      title: "正在获取 292 Token…",
+      title: `正在获取 ${bound} Token…`,
       body: fetchError,
       loading: true,
     };
@@ -298,7 +299,7 @@ export default function App() {
           <div className="banner banner--error" role="alert">
             <span>
               <TriangleAlert size={14} style={{ verticalAlign: "middle", marginRight: 4 }} />
-              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}，正在通过出站代理重新采集 292 token…
+              检测到 312 降智信号{fwd.status.degradedAt ? `（${fwd.status.degradedAt}）` : ""}，正在通过出站代理重新采集 {turn?.boundTokenLen ?? 292} token…
             </span>
           </div>
         ) : null}

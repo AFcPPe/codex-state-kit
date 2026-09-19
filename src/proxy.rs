@@ -188,7 +188,7 @@ impl App {
         Ok(self.status().await)
     }
 
-    /// 用户切换绑定的 token 长度（传 None 恢复默认 292）
+    /// 用户切换绑定的 token 长度（传 None 恢复账号自动识别的 292/332）
     pub async fn set_bound_token_len(&self, len: Option<usize>) -> Status {
         {
             let mut store = self.turn_state.lock().await;

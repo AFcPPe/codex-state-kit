@@ -14,8 +14,10 @@ pub const PREFETCH_AGE_SECS: i64 = 2100;
 /// 模型活跃窗口：60 分钟内有请求则视为活跃，持续预取
 const ACTIVE_WINDOW_SECS: i64 = 3600;
 
-/// 正常 token 长度约 292
+/// 正常 token 长度约 292。一个账号只会出 292 或 332，不会同时出现。
 pub const QUALITY_TOKEN_LEN: usize = 292;
+/// 另一档正常 token 长度约 332
+pub const QUALITY_TOKEN_LEN_332: usize = 332;
 /// 降智 token 长度约 312
 pub const DEGRADED_TOKEN_LEN: usize = 312;
 
@@ -80,7 +82,7 @@ pub struct TurnStateView {
     pub source: Option<String>,
     pub captured_at: Option<String>,
     pub models: Vec<ModelTokenView>,
-    /// 当前绑定的 token 长度，默认 292
+    /// 当前绑定的 token 长度（用户指定，或账号自动识别的 292/332）
     pub bound_token_len: usize,
 }
 
@@ -95,9 +97,12 @@ struct PersistedStore {
     /// model → 上次从代理请求中见到的 unix 时间戳
     #[serde(default)]
     active_models: HashMap<String, i64>,
-    /// 全局绑定的 token 长度，None = 默认 292
+    /// 全局绑定的 token 长度，None = 跟随账号自动识别
     #[serde(default)]
     bound_token_len: Option<usize>,
+    /// 该账号见到的质量 token 长度（292 或 332）
+    #[serde(default)]
+    auto_quality_len: Option<usize>,
     /// 模型级绑定覆盖：model → 该模型专属的绑定长度
     #[serde(default)]
     model_bound_lens: HashMap<String, usize>,
@@ -124,8 +129,10 @@ pub struct TurnStateStore {
     pool: HashMap<String, Vec<TurnState>>,
     /// model → 上次请求经过代理时的 unix 时间戳
     active_models: HashMap<String, i64>,
-    /// 全局绑定的 token 长度（None = 默认 292）
+    /// 全局绑定的 token 长度（None = 跟随账号自动识别的 292/332）
     bound_token_len: Option<usize>,
+    /// 该账号见到的质量 token 长度（292 或 332）
+    auto_quality_len: Option<usize>,
     /// 模型级绑定覆盖：model → 该模型专属的绑定长度（优先于全局）
     model_bound_lens: HashMap<String, usize>,
     /// 每个模型最近一轮 fetch 的 token 长度分布
@@ -141,6 +148,7 @@ impl Default for TurnStateStore {
             pool: HashMap::new(),
             active_models: HashMap::new(),
             bound_token_len: None,
+            auto_quality_len: None,
             model_bound_lens: HashMap::new(),
             distributions: HashMap::new(),
             account_id: None,
@@ -220,11 +228,19 @@ impl TurnStateStore {
                 if !dist.is_empty() {
                     eprintln!("[token] 恢复 {} 个模型的分布数据", dist.len());
                 }
+                let auto = store
+                    .auto_quality_len
+                    .and_then(canonical_quality_len)
+                    .or_else(|| infer_auto_quality_len(&tokens, &pool));
+                if let Some(len) = auto {
+                    eprintln!("[token] 账号默认质量长度: {}", len);
+                }
                 return Self {
                     tokens,
                     pool,
                     active_models: store.active_models,
                     bound_token_len: bound,
+                    auto_quality_len: auto,
                     model_bound_lens: mbl,
                     distributions: dist,
                     account_id: store.account_id,
@@ -253,11 +269,13 @@ impl TurnStateStore {
                     .iter()
                     .map(|(model, ts)| (model.clone(), vec![ts.clone()]))
                     .collect();
+                let auto = infer_auto_quality_len(&tokens, &pool);
                 return Self {
                     tokens,
                     pool,
                     active_models,
                     bound_token_len: None,
+                    auto_quality_len: auto,
                     model_bound_lens: HashMap::new(),
                     distributions: HashMap::new(),
                     account_id: None,
@@ -269,6 +287,7 @@ impl TurnStateStore {
         if let Ok(ts) = serde_json::from_str::<TurnState>(&raw) {
             if ts.token.starts_with("gAAAAA") {
                 eprintln!("[token] 从磁盘恢复旧格式 token（{}字节），放入 _default", ts.len);
+                let auto = canonical_quality_len(ts.len);
                 let mut tokens = HashMap::new();
                 tokens.insert("_default".to_string(), ts.clone());
                 let mut pool = HashMap::new();
@@ -278,6 +297,7 @@ impl TurnStateStore {
                     pool,
                     active_models: HashMap::new(),
                     bound_token_len: None,
+                    auto_quality_len: auto,
                     model_bound_lens: HashMap::new(),
                     distributions: HashMap::new(),
                     account_id: None,
@@ -297,6 +317,7 @@ impl TurnStateStore {
             tokens: self.tokens.clone(),
             active_models: self.active_models.clone(),
             bound_token_len: self.bound_token_len,
+            auto_quality_len: self.auto_quality_len,
             model_bound_lens: self.model_bound_lens.clone(),
             pool: self.pool.clone(),
             distributions: self.distributions.clone(),
@@ -335,9 +356,11 @@ impl TurnStateStore {
 
     // ─── 绑定 / 分布 ───────────────────────────────────────────
 
-    /// 全局绑定的目标 token 长度
+    /// 全局绑定的目标 token 长度。未手动指定时跟随账号见到的 292 或 332。
     pub fn bound_len(&self) -> usize {
-        self.bound_token_len.unwrap_or(QUALITY_TOKEN_LEN)
+        self.bound_token_len
+            .or(self.auto_quality_len)
+            .unwrap_or(QUALITY_TOKEN_LEN)
     }
 
     /// 获取某模型实际使用的绑定长度（模型级优先，否则用全局）
@@ -353,7 +376,7 @@ impl TurnStateStore {
         self.model_bound_lens.get(model).copied()
     }
 
-    /// 设置全局绑定长度（传 None 恢复默认 292）。
+    /// 设置全局绑定长度（传 None 恢复账号自动识别的 292/332）。
     /// 从 pool 中提升匹配的 token 到 tokens（仅影响没有模型级覆盖的模型）。
     pub fn set_bound_len(&mut self, len: Option<usize>) {
         self.bound_token_len = len;
@@ -498,6 +521,8 @@ impl TurnStateStore {
             self.active_models.clear();
             self.distributions.clear();
             self.model_bound_lens.clear();
+            self.bound_token_len = None;
+            self.auto_quality_len = None;
         }
         self.account_id = Some(account_id.to_string());
         self.persist();
@@ -520,6 +545,7 @@ impl TurnStateStore {
         } else {
             entries.push(state.clone());
         }
+        self.observe_quality_len(state.len);
         // 如果匹配该模型的绑定长度，同时更新 tokens（活跃注入用）
         let target = self.bound_len_for(model);
         if is_matching_token_len(state.len, target) {
@@ -531,18 +557,31 @@ impl TurnStateStore {
     /// 批量将一组 token 全部入池，然后一次性持久化。
     /// 返回匹配绑定长度的 token 数量。
     pub fn capture_batch(&mut self, model: &str, tokens: &[String], source: &str) -> usize {
-        let target = self.bound_len_for(model);
         let mut matched = 0;
         for token in tokens {
             if self.store_to_pool(model, token, source) {
                 let len = token.trim().len();
-                if is_matching_token_len(len, target) {
+                if is_matching_token_len(len, self.bound_len_for(model)) {
                     matched += 1;
                 }
             }
         }
         self.persist();
         matched
+    }
+
+    fn observe_quality_len(&mut self, len: usize) {
+        let Some(canon) = canonical_quality_len(len) else {
+            return;
+        };
+        if self.auto_quality_len == Some(canon) {
+            return;
+        }
+        eprintln!("[token] 账号质量长度识别为 {canon}");
+        self.auto_quality_len = Some(canon);
+        if self.bound_token_len.is_none() {
+            self.promote_all_from_pool();
+        }
     }
 
     /// 兼容旧接口：存入匹配绑定长度的 token 到 tokens + pool。
@@ -963,23 +1002,42 @@ pub fn is_matching_token_len(actual: usize, target: usize) -> bool {
     (low..=high).contains(&actual)
 }
 
+pub fn canonical_quality_len(len: usize) -> Option<usize> {
+    if is_matching_token_len(len, QUALITY_TOKEN_LEN) {
+        Some(QUALITY_TOKEN_LEN)
+    } else if is_matching_token_len(len, QUALITY_TOKEN_LEN_332) {
+        Some(QUALITY_TOKEN_LEN_332)
+    } else {
+        None
+    }
+}
+
+fn infer_auto_quality_len(
+    tokens: &HashMap<String, TurnState>,
+    pool: &HashMap<String, Vec<TurnState>>,
+) -> Option<usize> {
+    tokens
+        .values()
+        .map(|ts| ts.len)
+        .chain(pool.values().flat_map(|entries| entries.iter().map(|ts| ts.len)))
+        .find_map(canonical_quality_len)
+}
+
 pub fn is_degraded_token(token: &str) -> bool {
     let len = token.trim().len();
     (308..=316).contains(&len)
 }
 
 pub fn is_quality_token(token: &str) -> bool {
-    let len = token.trim().len();
-    (288..=296).contains(&len)
+    canonical_quality_len(token.trim().len()).is_some()
 }
 
 pub fn token_quality_label(token: &str) -> &'static str {
-    if is_quality_token(token) {
-        "292/normal"
-    } else if is_degraded_token(token) {
-        "312/degraded"
-    } else {
-        "unknown"
+    match canonical_quality_len(token.trim().len()) {
+        Some(QUALITY_TOKEN_LEN) => "292/normal",
+        Some(QUALITY_TOKEN_LEN_332) => "332/normal",
+        _ if is_degraded_token(token) => "312/degraded",
+        _ => "unknown",
     }
 }
 
@@ -1150,6 +1208,8 @@ mod tests {
         assert!(store.bind_account("acct-b"));
         assert_eq!(store.fresh_count(), 0);
         assert!(store.all_active_models().is_empty());
+        assert_eq!(store.bound_len(), QUALITY_TOKEN_LEN);
+        assert!(store.auto_quality_len.is_none());
     }
 
     #[test]
@@ -1168,6 +1228,29 @@ mod tests {
         let long = "a".repeat(312);
         assert!(is_degraded_token(&long));
         assert!(!is_quality_token(&long));
+        let alt = "a".repeat(332);
+        assert!(is_quality_token(&alt));
+        assert!(!is_degraded_token(&alt));
+        assert_eq!(token_quality_label(&alt), "332/normal");
+        assert_eq!(canonical_quality_len(332), Some(QUALITY_TOKEN_LEN_332));
+    }
+
+    #[test]
+    fn auto_default_follows_292_or_332() {
+        let mut store = TurnStateStore::default();
+        assert_eq!(store.bound_len(), QUALITY_TOKEN_LEN);
+
+        let t332 = token_for_len(now_unix() - 10, QUALITY_TOKEN_LEN_332);
+        assert!(canonical_quality_len(t332.trim().len()) == Some(QUALITY_TOKEN_LEN_332));
+        assert!(store.capture("gpt-6-astra", &t332, "fetch"));
+        assert_eq!(store.bound_len(), QUALITY_TOKEN_LEN_332);
+        assert!(store.peek_for_model("gpt-6-astra").is_some());
+
+        let mut other = TurnStateStore::default();
+        let t292 = token_for(now_unix() - 10);
+        assert!(other.capture("gpt-6-astra", &t292, "fetch"));
+        assert_eq!(other.bound_len(), QUALITY_TOKEN_LEN);
+        assert!(other.peek_for_model("gpt-6-astra").is_some());
     }
 
     #[test]
@@ -1281,6 +1364,7 @@ mod tests {
             tokens: store.tokens.clone(),
             active_models: store.active_models.clone(),
             bound_token_len: store.bound_token_len,
+            auto_quality_len: store.auto_quality_len,
             model_bound_lens: store.model_bound_lens.clone(),
             pool: store.pool.clone(),
             distributions: store.distributions.clone(),
