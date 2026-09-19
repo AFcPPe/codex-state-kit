@@ -40,6 +40,21 @@ corepack pnpm dev
 
 推送形如 `v0.0.1` 的标签会触发 `.github/workflows/release.yml`，并行构建 Windows x64、macOS Intel 和 macOS Apple Silicon，随后将 `.exe`、`.msi` 和 `.dmg` 上传到同一个 GitHub Release。也可以在 Actions 页面手动运行工作流。
 
+发布说明来自**附注标签**的正文，不要用轻量标签。PowerShell 示例：
+
+```powershell
+git tag -a v0.0.4 -m @"
+本次更新：
+- 说明一
+- 说明二
+
+Mac 版本当前为未公证构建；首次打开时请按系统提示允许应用运行。
+"@
+git push origin v0.0.4
+```
+
+在 Actions 里手动跑工作流时，也可以在 `notes` 输入框填写说明。已经生成的 Release 仍可在 GitHub 上点 Edit 改说明。未写附注时才回落到默认文案。
+
 当前工作流生成未签名、未公证的 Mac 包。正式分发前，在仓库 Secrets 配置 Apple Developer 证书和公证凭据，并在工作流中接入 Tauri 的签名环境变量；否则 macOS 可能显示安全提示。
 
 ## 版本与产物

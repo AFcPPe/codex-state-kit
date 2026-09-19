@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      notes:
+        description: "发布说明。留空则使用标签附注，再没有则用默认文案"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -39,6 +44,29 @@ jobs:
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 读取发布说明
+        id: notes
+        shell: bash
+        env:
+          MANUAL_NOTES: ${{ github.event.inputs.notes }}
+        run: |
+          default='下载对应系统的安装包即可。Mac 版本当前为未公证构建；首次打开时请按系统提示允许应用运行。'
+          notes="${MANUAL_NOTES:-}"
+          if [ -z "$notes" ] && [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            notes="$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}")"
+          fi
+          if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
+            notes="$default"
+          fi
+          delim="NOTES_${RANDOM}_${RANDOM}"
+          {
+            echo "body<<${delim}"
+            printf '%s\n' "$notes"
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: 安装 pnpm
         uses: pnpm/action-setup@v4
@@ -75,10 +103,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: Codex State Kit v__VERSION__
-          releaseBody: |
-            Codex State Kit v__VERSION__
-
-            下载对应系统的安装包即可。Mac 版本当前为未公证构建；首次打开时请按系统提示允许应用运行。
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.target_args }}
