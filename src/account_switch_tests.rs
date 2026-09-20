@@ -135,6 +135,41 @@ async fn account_switch_preserves_request_identity_and_rejects_old_tickets() {
         assert_eq!(status.current_account_email.as_deref(), Some("account-b@example.com"));
         assert!(app.turn_state.lock().await.is_bound_to_account("account-b"));
         assert_eq!(status.account_traffic.concurrent_requests, 0);
+        // An account switch must interrupt a probe's old
+        // cooldown instead of waiting for that entire cooldown to elapse.
+        app.defer_next_fetch(Duration::from_secs(30)).await;
+        let probe_app = app.clone();
+        let cooling_probe = tokio::spawn(async move { probe_app.fetch_once("switch-model").await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if app.fetch_gate.try_lock().is_err() { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        write_account(home.path(), "account-c");
+        let switched = tokio::time::timeout(Duration::from_secs(2), app.sync_request_identity(home.path())).await;
+        assert!(switched.is_ok(), "account switch is blocked behind the previous account's fetch cooldown");
+        assert_eq!(switched.unwrap().unwrap().0.account_id, "account-c");
+        assert_eq!(cooling_probe.await.unwrap().unwrap_err().retry, FetchRetryClass::Stale);
+        assert!(app.turn_state.lock().await.is_bound_to_account("account-c"));
+
+        // Cancelling an identity switch while a probe is in flight must not
+        // leave the generation odd and permanently disable future fetching.
+        write_account(home.path(), "account-d");
+        let gate = app.fetch_gate.lock().await;
+        let switch_app = app.clone();
+        let switch_home = home.path().to_path_buf();
+        let switching = tokio::spawn(async move { switch_app.sync_request_identity(&switch_home).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while app.fetch_generation.load(Ordering::SeqCst) % 2 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        switching.abort();
+        assert!(switching.await.unwrap_err().is_cancelled());
+        assert_eq!(app.fetch_generation.load(Ordering::SeqCst) % 2, 0);
+        drop(gate);
+        assert_eq!(app.sync_request_identity(home.path()).await.unwrap().0.account_id, "account-d");
         server.abort();
     }).await.unwrap();
 }

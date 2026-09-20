@@ -253,14 +253,18 @@ pub(crate) struct ChatGptCredentials {
     pub email: Option<String>,
 }
 
-pub(crate) fn chatgpt_credentials(home: &Path) -> Result<ChatGptCredentials> {
+pub(crate) fn request_credentials(home: &Path) -> Result<(ChatGptCredentials, bool)> {
     if let Some(creds) = credentials_from_file(&kit_auth_path(home))? {
-        return Ok(creds);
+        return Ok((creds, true));
     }
     if let Some(creds) = credentials_from_file(&official_auth_path(home))? {
-        return Ok(creds);
+        return Ok((creds, false));
     }
     bail!("尚未登录 ChatGPT。请先在本应用完成 ChatGPT 登录。");
+}
+
+pub(crate) fn chatgpt_credentials(home: &Path) -> Result<ChatGptCredentials> {
+    request_credentials(home).map(|(creds, _)| creds)
 }
 
 fn credentials_from_file(path: &Path) -> Result<Option<ChatGptCredentials>> {
@@ -303,28 +307,65 @@ fn credentials_from_auth(auth: &Value) -> Result<ChatGptCredentials> {
     })
 }
 
-/// Kit 已独立登录时，用 Kit 账号替换转发请求上的鉴权头，官方客户端无需重启。
-pub fn apply_kit_auth_headers(headers: &mut HeaderMap, home: &Path) -> Option<LoginStatus> {
-    // Read one immutable credential snapshot and validate both headers before
-    // replacing either. A concurrent login must never split token and account.
-    let Ok(Some(creds)) = credentials_from_file(&kit_auth_path(home)) else {
-        return None;
-    };
+pub(crate) fn apply_chatgpt_credentials_headers(
+    headers: &mut HeaderMap,
+    creds: &ChatGptCredentials,
+) -> bool {
     let (Ok(auth), Ok(account)) = (
         HeaderValue::from_str(&format!("Bearer {}", creds.access_token)),
         HeaderValue::from_str(&creds.account_id),
     ) else {
-        return None;
+        return false;
     };
     headers.insert(http::header::AUTHORIZATION, auth);
     headers.insert(HeaderName::from_static("chatgpt-account-id"), account);
     headers.remove(http::header::COOKIE);
+    true
+}
+
+/// Kit 已独立登录时，用 Kit 账号替换转发请求上的鉴权头，官方客户端无需重启。
+pub fn apply_kit_auth_headers(headers: &mut HeaderMap, home: &Path) -> Option<LoginStatus> {
+    let Ok(Some(creds)) = credentials_from_file(&kit_auth_path(home)) else {
+        return None;
+    };
+    if !apply_chatgpt_credentials_headers(headers, &creds) {
+        return None;
+    }
     Some(LoginStatus {
         logged_in: true,
         auth_mode: Some("chatgpt".into()),
         account_id: Some(creds.account_id),
         email: creds.email,
     })
+}
+
+pub(crate) fn credentials_match_headers(
+    headers: &HeaderMap,
+    creds: &ChatGptCredentials,
+) -> bool {
+    (headers.contains_key("chatgpt-account-id") || headers.contains_key(http::header::AUTHORIZATION))
+        && !credentials_conflict_headers(headers, creds)
+}
+
+/// Absence is not a conflict: Kit may supply both authentication headers.
+/// When a client explicitly supplies either field, validate it before override.
+pub(crate) fn credentials_conflict_headers(
+    headers: &HeaderMap,
+    creds: &ChatGptCredentials,
+) -> bool {
+    let account_conflict = headers
+        .get("chatgpt-account-id")
+        .is_some_and(|value| value.to_str().ok().is_none_or(|value| value.trim() != creds.account_id));
+    let authorization_conflict = headers
+        .get(http::header::AUTHORIZATION)
+        .is_some_and(|value| {
+            value.to_str().ok().is_none_or(|value| {
+                !value.split_once(' ').is_some_and(|(scheme, token)| {
+                    scheme.eq_ignore_ascii_case("bearer") && token.trim() == creds.access_token
+                })
+            })
+        });
+    account_conflict || authorization_conflict
 }
 
 pub async fn start_device_login(
@@ -979,6 +1020,8 @@ mod tests {
         let creds = chatgpt_credentials(home.path()).unwrap();
         assert_eq!(creds.access_token, "access");
         assert_eq!(creds.account_id, "acct");
+        let (_, override_headers) = request_credentials(home.path()).unwrap();
+        assert!(!override_headers);
     }
 
     #[test]
@@ -1136,6 +1179,9 @@ mod tests {
         let creds = chatgpt_credentials(home.path()).unwrap();
         assert_eq!(creds.access_token, "kit-access");
         assert_eq!(creds.account_id, "kit");
+        let (request_creds, override_headers) = request_credentials(home.path()).unwrap();
+        assert!(override_headers);
+        assert_eq!(request_creds.account_id, "kit");
         assert_eq!(login_status(home.path()).account_id.as_deref(), Some("kit"));
 
         let mut headers = HeaderMap::new();
@@ -1143,8 +1189,15 @@ mod tests {
             http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer official-access"),
         );
+        headers.insert(
+            HeaderName::from_static("chatgpt-account-id"),
+            HeaderValue::from_static("kit"),
+        );
         headers.insert(http::header::COOKIE, HeaderValue::from_static("session=old"));
+        // Matching one identity field is insufficient when another explicitly conflicts.
+        assert!(!credentials_match_headers(&headers, &request_creds));
         apply_kit_auth_headers(&mut headers, home.path());
+        assert!(credentials_match_headers(&headers, &request_creds));
         assert_eq!(
             headers.get(http::header::AUTHORIZATION).unwrap(),
             "Bearer kit-access"

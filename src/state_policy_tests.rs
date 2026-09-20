@@ -110,6 +110,65 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
         axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
         assert!(!received.recv().await.unwrap().contains_key(turn_state::HEADER_NAME));
 
+        // Reject explicit identity conflicts before either Kit header override
+        // or waiting. A cached ticket and an absent state header are not bypasses.
+        for kit_override in [true, false] {
+            if !kit_override {
+                std::fs::rename(login::kit_auth_path(home.path()), home.path().join("auth.json")).unwrap();
+            }
+            app.settings.lock().await.state_miss_policy = Wait;
+            for cached in [false, true] {
+                app.turn_state.lock().await.invalidate_all();
+                if cached { app.turn_state.lock().await.capture("policy-model", &fresh, "test"); }
+                for has_state in [false, true] {
+                    for (account, bearer) in [
+                        (Some("account-b"), Some("Bearer test-access")),
+                        (Some("account-a"), Some("Bearer conflicting-secret")),
+                        (None, Some("Bearer conflicting-secret")),
+                    ] {
+                        let mut req = request(has_state, true);
+                        req.headers_mut().remove("chatgpt-account-id");
+                        if let Some(account) = account {
+                            req.headers_mut().insert("chatgpt-account-id", HeaderValue::from_str(account).unwrap());
+                        }
+                        if let Some(bearer) = bearer {
+                            req.headers_mut().insert(header::AUTHORIZATION, HeaderValue::from_str(bearer).unwrap());
+                        }
+                        let traffic_before = app.traffic.view(Some("account-a"), Instant::now());
+                        let response = tokio::time::timeout(Duration::from_secs(1), proxy_http(app.clone(), req))
+                            .await.expect("identity conflicts must return immediately, not wait");
+                        assert_eq!(response.status(), StatusCode::CONFLICT);
+                        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+                        assert!(String::from_utf8_lossy(&body).contains("账号凭据不匹配"));
+                        assert!(received.try_recv().is_err(), "a rejected request reached upstream");
+                        assert_eq!(app.traffic.view(Some("account-a"), Instant::now()), traffic_before);
+                        let logs = app.logs.lock().await;
+                        let entry = logs.back().unwrap();
+                        assert_eq!(entry.error_kind.as_deref(), Some("state_account_mismatch"));
+                        assert!(!serde_json::to_string(entry).unwrap().contains("conflicting-secret"));
+                    }
+                }
+            }
+            // Matching credentials still forward successfully in both modes.
+            app.turn_state.lock().await.capture("policy-model", &fresh, "test");
+            let mut req = request(true, true);
+            req.headers_mut().insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer test-access"));
+            let response = proxy_http(app.clone(), req).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(received.recv().await.unwrap()[turn_state::HEADER_NAME], fresh);
+        }
+        write_login(home.path(), "account-a");
+        // Absent identity is allowed when Kit supplies it from its own login.
+        let mut req = request(true, true);
+        req.headers_mut().remove("chatgpt-account-id");
+        let response = proxy_http(app.clone(), req).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let headers = received.recv().await.unwrap();
+        assert_eq!(headers["authorization"], "Bearer test-access");
+        assert_eq!(headers[turn_state::HEADER_NAME], fresh);
+
         app.settings.lock().await.state_miss_policy = Wait;
         let response = proxy_http(app.clone(), request(true, false)).await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
