@@ -376,6 +376,17 @@ impl TurnStateStore {
         self.model_bound_lens.get(model).copied()
     }
 
+    /// 尚无任何显式或自动质量长度时，允许首张 292/332 质量票确定账号档位。
+    pub fn allows_auto_quality_discovery(&self, model: &str) -> bool {
+        self.model_bound_len(model).is_none()
+            && self.bound_token_len.is_none()
+            && self.auto_quality_len.is_none()
+    }
+
+    pub fn is_bound_to_account(&self, account_id: &str) -> bool {
+        self.account_id.as_deref() == Some(account_id.trim())
+    }
+
     /// 设置全局绑定长度（传 None 恢复账号自动识别的 292/332）。
     /// 从 pool 中提升匹配的 token 到 tokens（仅影响没有模型级覆盖的模型）。
     pub fn set_bound_len(&mut self, len: Option<usize>) {

@@ -173,10 +173,10 @@ pub fn safe_content_encoding(raw: Option<&str>) -> String {
 }
 
 pub fn request_error_kind(error: &reqwest::Error) -> String {
-    if error.is_timeout() {
-        "timeout"
-    } else if error.is_connect() {
+    if error.is_connect() {
         "connect"
+    } else if error.is_timeout() {
+        "timeout"
     } else if error.is_request() {
         "request"
     } else if error.is_body() {
