@@ -370,6 +370,7 @@ export default function App() {
           <div className="proxy-mode" role="group" aria-label="出站代理模式">
             <button type="button" aria-pressed={fwd.status.outboundMode === "warp"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "warp")}><Cloud size={15} />内置 WARP</button>
             <button type="button" aria-pressed={fwd.status.outboundMode === "manual"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "manual")}><Network size={14} />手动代理</button>
+            <button type="button" aria-pressed={fwd.status.outboundMode === "direct"} disabled={fwd.busy !== null} onMouseDown={(event) => event.preventDefault()} onClick={() => void fwd.saveSettings(codexHome, outboundProxy, "direct")}><Network size={14} />不使用代理</button>
           </div>
           {fwd.status.outboundMode === "manual" ? <>
           <label className="field">
@@ -389,7 +390,7 @@ export default function App() {
             />
           </label>
           <p className="panel__hint">支持 socks5 / socks5h / http，离开输入框后自动保存。</p>
-          </> : <WarpPanel status={fwd.status.warp} onTerms={() => void fwd.openWarpTerms()} />}
+          </> : fwd.status.outboundMode === "warp" ? <WarpPanel status={fwd.status.warp} onTerms={() => void fwd.openWarpTerms()} /> : <p className="panel__hint">Token 获取将使用当前网络直连，不读取应用代理设置。</p>}
           <label className="field">
             <span>上游转发代理</span>
             <input

@@ -45,6 +45,9 @@ function ticketRoute(status: Status): string[] {
       : "出口待验证";
     return ["State Kit", `内置 WARP · ${endpoint} · ${exit}`, safeNetworkUrl(status.upstream, true)];
   }
+  if (status.outboundMode === "direct") {
+    return ["State Kit", "不使用代理 · 当前网络直连", safeNetworkUrl(status.upstream, true)];
+  }
   return [
     "State Kit",
     status.outboundProxy ? `手动代理 · ${safeNetworkUrl(effectiveProxyUrl(status.outboundProxy))}` : "手动代理未配置",
@@ -69,6 +72,8 @@ function routeLabel(entry: LogEntry): string {
       return `内置 WARP · ${entry.proxyEndpoint || "本地端点"} → ${entry.targetOrigin || "上游"}`;
     case "manual_proxy":
       return `手动代理 · ${entry.proxyEndpoint || "已配置"} → ${entry.targetOrigin || "上游"}`;
+    case "direct":
+      return `不使用代理 · ${entry.targetOrigin || "上游"}`;
     case "explicit_proxy":
       return `${entry.proxyEndpoint || "显式代理"} → ${entry.targetOrigin || "上游"}`;
     default:

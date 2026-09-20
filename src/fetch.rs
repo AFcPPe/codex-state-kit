@@ -115,6 +115,10 @@ pub fn http_client(outbound_proxy: &str) -> Result<reqwest::Client> {
     let proxy = outbound_proxy_for_client(outbound_proxy);
     if !proxy.is_empty() {
         builder = builder.proxy(reqwest::Proxy::all(&proxy).context("出站代理")?);
+    } else {
+        // Direct mode must not unexpectedly inherit HTTP(S)_PROXY or the
+        // platform proxy. The business route has its own separate setting.
+        builder = builder.no_proxy();
     }
     builder.build().context("build turn-state fetch client")
 }
@@ -165,7 +169,11 @@ pub(crate) async fn fetch_turn_state_with_log(
     *details = logs::token_network_details(
         &settings.upstream,
         &effective_proxy,
-        settings.outbound_mode == OutboundMode::Warp,
+        match settings.outbound_mode {
+            OutboundMode::Warp => logs::ROUTE_EMBEDDED_WARP,
+            OutboundMode::Manual => logs::ROUTE_MANUAL_PROXY,
+            OutboundMode::Direct => logs::ROUTE_DIRECT,
+        },
         model,
     );
     let probe = probe_body(model);

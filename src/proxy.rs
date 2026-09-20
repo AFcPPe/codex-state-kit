@@ -449,10 +449,14 @@ impl App {
 
     fn fetch_settings(&self, settings: &Settings) -> Result<Settings> {
         let mut effective = settings.clone();
-        if effective.outbound_mode == OutboundMode::Warp {
-            effective.outbound_proxy = self.warp.proxy_url()?;
+        match effective.outbound_mode {
+            OutboundMode::Warp => effective.outbound_proxy = self.warp.proxy_url()?,
+            OutboundMode::Direct => effective.outbound_proxy.clear(),
+            OutboundMode::Manual => {}
         }
-        if effective.outbound_proxy.trim().is_empty() {
+        if effective.outbound_mode == OutboundMode::Manual
+            && effective.outbound_proxy.trim().is_empty()
+        {
             anyhow::bail!("尚未配置出站代理");
         }
         Ok(effective)
@@ -1042,7 +1046,7 @@ impl ProxyHandle {
 
     pub async fn apply_settings(&self, patch: SettingsPatch) -> Result<Status> {
         let next = patch.into_settings()?;
-        let _change = if next.outbound_mode == OutboundMode::Manual {
+        let _change = if next.outbound_mode != OutboundMode::Warp {
             loop {
                 self.app.warp.cancel_connect();
                 tokio::select! {
@@ -1085,7 +1089,7 @@ impl ProxyHandle {
             *self.app.fetch_ok_at.lock().await = None;
             self.app.degraded.store(false, Ordering::Relaxed);
             *self.app.degraded_at.lock().await = None;
-            if next.outbound_mode == OutboundMode::Manual || old.warp_http2 != next.warp_http2 {
+            if next.outbound_mode != OutboundMode::Warp || old.warp_http2 != next.warp_http2 {
                 self.app.warp.stop().await;
             }
         }
@@ -1948,6 +1952,19 @@ mod tests {
             app.fetch_settings(&manual).unwrap().outbound_proxy,
             "http://127.0.0.1:7890"
         );
+    }
+
+    #[test]
+    fn direct_route_allows_an_empty_proxy_without_falling_back_to_warp() {
+        let settings = Settings {
+            outbound_mode: OutboundMode::Direct,
+            outbound_proxy: "http://127.0.0.1:7890".into(),
+            ..Settings::default()
+        };
+        let app = App::new(settings.clone()).unwrap();
+        let effective = app.fetch_settings(&settings).unwrap();
+        assert_eq!(effective.outbound_mode, OutboundMode::Direct);
+        assert!(effective.outbound_proxy.is_empty());
     }
 
     #[test]

@@ -57,7 +57,7 @@ openai_base_url = "http://127.0.0.1:8787"
 | `upstream` | 上游地址，默认 `https://chatgpt.com/backend-api/codex` |
 | `codex_home` | Codex 配置目录的完整路径 |
 | `outbound_mode` | `warp` 或 `manual`，新配置默认 `warp` |
-| `outbound_proxy` | 手动代理 URL；切换模式时保留 |
+| `outbound_proxy` | 手动代理 URL；切换模式时保留。`outbound_mode` 为 `direct` 时不会使用该值 |
 | `upstream_proxy` | 独立的上游业务转发代理，默认空；例如 `http://127.0.0.1:7897`，保存后对新请求生效 |
 | `warp_http2` | 是否优先使用 TCP，默认 `false`；应用支持自动回退 |
 

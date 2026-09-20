@@ -113,7 +113,7 @@ export interface SettingsPatch {
   warpHttp2: boolean;
 }
 
-export type OutboundMode = "manual" | "warp";
+export type OutboundMode = "manual" | "warp" | "direct";
 export type StateMissPolicy = "preserve" | "wait" | "strip" | "passthrough" | "strip_all";
 
 export interface WarpStatus {

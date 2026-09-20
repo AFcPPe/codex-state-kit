@@ -170,7 +170,7 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
     return invoke<Status>("set_config", { settings });
   }
   const tokenRouteChanged = settings.outboundMode !== mockStatus.outboundMode || settings.warpHttp2 !== mockStatus.warpHttp2 || settings.outboundProxy !== mockStatus.outboundProxy || settings.codexHome !== mockStatus.codexHome || settings.upstream !== mockStatus.upstream;
-  if (tokenRouteChanged && (settings.outboundMode === "manual" || settings.warpHttp2 !== mockStatus.warpHttp2)) {
+  if (tokenRouteChanged && (settings.outboundMode !== "warp" || settings.warpHttp2 !== mockStatus.warpHttp2)) {
     await stopWarp();
   }
   if (tokenRouteChanged) {
@@ -212,7 +212,7 @@ export async function refreshTurnState(): Promise<Status> {
   if (isTauri) {
     return invoke<Status>("refresh_turn_state");
   }
-  const ready = mockStatus.outboundMode === "warp" ? mockStatus.warp.phase === "connected" : Boolean(mockStatus.outboundProxy);
+  const ready = mockStatus.outboundMode === "warp" ? mockStatus.warp.phase === "connected" : mockStatus.outboundMode === "direct" || Boolean(mockStatus.outboundProxy);
   mockStatus = {
     ...mockStatus,
     fetchError: ready ? null : "出站代理尚未就绪",

@@ -12,6 +12,7 @@ pub const ROUTE_DEFAULT_SYSTEM: &str = "default_system";
 pub const ROUTE_EXPLICIT_PROXY: &str = "explicit_proxy";
 pub const ROUTE_EMBEDDED_WARP: &str = "embedded_warp";
 pub const ROUTE_MANUAL_PROXY: &str = "manual_proxy";
+pub const ROUTE_DIRECT: &str = "direct";
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MAX_LOGS: usize = 80;
 const MAX_TOKEN_FETCH_LOGS: usize = 30;
@@ -466,19 +467,15 @@ pub fn network_details(upstream: &str, proxy: &str) -> NetworkLogDetails {
 pub fn token_network_details(
     upstream: &str,
     proxy: &str,
-    embedded_warp: bool,
+    route_kind: &str,
     model: &str,
 ) -> NetworkLogDetails {
     NetworkLogDetails {
         flow: "token_fetch".into(),
         transport: "http_sse".into(),
         target_origin: endpoint_origin(upstream),
-        route_kind: if embedded_warp {
-            ROUTE_EMBEDDED_WARP.into()
-        } else {
-            ROUTE_MANUAL_PROXY.into()
-        },
-        proxy_endpoint: Some(endpoint_origin(proxy)),
+        route_kind: route_kind.into(),
+        proxy_endpoint: (!proxy.trim().is_empty()).then(|| endpoint_origin(proxy)),
         model: Some(safe_text(model, 80)).filter(|value| !value.is_empty()),
         content_encoding: "json".into(),
         turn_state_action: "awaiting_response".into(),
@@ -1072,7 +1069,7 @@ mod tests {
         let details = token_network_details(
             "https://chatgpt.com/backend-api/codex",
             "socks5h://statekit:private@127.0.0.1:1080",
-            true,
+            ROUTE_EMBEDDED_WARP,
             "gpt-6-astra",
         );
         assert_eq!(details.flow, "token_fetch");
@@ -1089,7 +1086,7 @@ mod tests {
         let details = token_network_details(
             "https://chatgpt.com/backend-api/codex",
             "socks5h://proxy.example.test:44445",
-            false,
+            ROUTE_MANUAL_PROXY,
             "gpt-6-astra",
         );
         assert_eq!(details.route_kind, ROUTE_MANUAL_PROXY);
@@ -1130,7 +1127,7 @@ mod tests {
                     token_network_details(
                         "https://chatgpt.com",
                         "socks5h://127.0.0.1:1080",
-                        true,
+                        ROUTE_EMBEDDED_WARP,
                         "gpt-6-astra",
                     ),
                 ),

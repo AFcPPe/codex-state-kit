@@ -9,6 +9,7 @@ pub enum OutboundMode {
     #[default]
     Manual,
     Warp,
+    Direct,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +300,22 @@ mod tests {
                 .outbound_mode,
             OutboundMode::Manual
         );
+    }
+
+    #[test]
+    fn direct_mode_round_trips_without_an_outbound_proxy() {
+        let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
+            "proxyListen": "127.0.0.1:8787", "upstream": "https://example.com",
+            "codexHome": "test", "outboundMode": "direct", "outboundProxy": ""
+        }))
+        .unwrap();
+        let settings = patch.into_settings().unwrap();
+        assert_eq!(settings.outbound_mode, OutboundMode::Direct);
+        assert!(settings.outbound_proxy.is_empty());
+
+        let saved: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(saved.outbound_mode, OutboundMode::Direct);
     }
 
     #[test]
