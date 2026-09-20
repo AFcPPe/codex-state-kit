@@ -14,6 +14,8 @@ const MAX_TOKEN_FETCH_LOGS: usize = 30;
 
 #[derive(Clone, Debug, Default)]
 pub struct NetworkLogDetails {
+    pub account_id: Option<String>,
+    pub account_email: Option<String>,
     pub flow: String,
     pub transport: String,
     pub target_origin: String,
@@ -31,17 +33,30 @@ pub struct NetworkLogDetails {
     pub error_kind: Option<String>,
     pub response_status: Option<u16>,
     pub response_header_ms: Option<u128>,
+    pub response_content_encoding: Option<String>,
+    pub first_token_ms: Option<u128>,
+    pub output_tokens: Option<u64>,
+    pub tokens_per_second: Option<f64>,
+    pub in_progress: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogEntry {
+    pub account_id: Option<String>,
+    pub account_email: Option<String>,
     pub id: u64,
     pub ts: String,
     pub method: String,
     pub path: String,
     pub status: u16,
     pub ms: u128,
+    pub response_header_ms: Option<u128>,
+    pub response_content_encoding: Option<String>,
+    pub first_token_ms: Option<u128>,
+    pub output_tokens: Option<u64>,
+    pub tokens_per_second: Option<f64>,
+    pub in_progress: bool,
     pub flow: String,
     pub transport: String,
     pub target_origin: String,
@@ -72,11 +87,19 @@ impl LogEntry {
             .unwrap_or_else(|| started.elapsed().as_millis());
         Self {
             id: LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            account_id: details.account_id,
+            account_email: details.account_email,
             ts: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
             method: method.to_string(),
             path: path.to_string(),
             status,
             ms,
+            response_header_ms: details.response_header_ms,
+            response_content_encoding: details.response_content_encoding,
+            first_token_ms: details.first_token_ms,
+            output_tokens: details.output_tokens,
+            tokens_per_second: details.tokens_per_second,
+            in_progress: details.in_progress,
             flow: details.flow,
             transport: details.transport,
             target_origin: details.target_origin,
@@ -166,8 +189,8 @@ pub fn token_network_details(
 pub fn safe_content_encoding(raw: Option<&str>) -> String {
     let value = raw.unwrap_or("none").trim().to_ascii_lowercase();
     match value.as_str() {
-        "" | "identity" => "none".into(),
-        "gzip" | "br" | "deflate" | "zstd" => value,
+        "" | "none" | "identity" => "none".into(),
+        "gzip" | "x-gzip" | "br" | "deflate" | "zstd" => value,
         _ => "other".into(),
     }
 }
@@ -187,6 +210,298 @@ pub fn request_error_kind(error: &reqwest::Error) -> String {
         "upstream"
     }
     .into()
+}
+
+/// Tracks response-level timing without retaining or logging response content.
+/// For SSE, first-token timing follows the visible-output event (`delta`, text,
+/// tool arguments, or image content) rather than response headers/preamble.
+#[derive(Clone, Debug, Default)]
+pub struct ResponseMetrics {
+    first_token_ms: Option<u128>,
+    output_tokens: Option<u64>,
+    line: Vec<u8>,
+    data: Vec<u8>,
+    skip_event: bool,
+    after_cr: bool,
+    is_sse: bool,
+    completed: bool,
+    pub error_kind: Option<&'static str>,
+}
+
+// Decode only the statistics side channel. The proxy forwards original bytes.
+// The writer feeds the bounded event parser directly, never collecting a whole
+// decompressed response in memory.
+#[derive(Default)]
+struct MetricsSink {
+    metrics: ResponseMetrics,
+    elapsed_ms: u128,
+    is_sse: bool,
+}
+
+impl std::io::Write for MetricsSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.metrics.observe(bytes, self.elapsed_ms, self.is_sse);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+enum MetricsDecoder {
+    Plain(MetricsSink),
+    Zstd(zstd::stream::write::Decoder<'static, MetricsSink>),
+    Gzip(flate2::write::GzDecoder<MetricsSink>),
+    Deflate(flate2::write::ZlibDecoder<MetricsSink>),
+}
+
+pub struct ResponseBodyMetrics {
+    decoder: MetricsDecoder,
+    disabled: bool,
+}
+
+impl ResponseBodyMetrics {
+    pub fn new(encoding: &str) -> Self {
+        let decoder = match encoding.trim().to_ascii_lowercase().as_str() {
+            "" | "identity" => Some(MetricsDecoder::Plain(MetricsSink::default())),
+            "zstd" => zstd::stream::write::Decoder::new(MetricsSink::default())
+                .and_then(|mut decoder| {
+                    decoder.window_log_max(23)?;
+                    Ok(MetricsDecoder::Zstd(decoder))
+                })
+                .ok(),
+            "gzip" | "x-gzip" => Some(MetricsDecoder::Gzip(flate2::write::GzDecoder::new(
+                MetricsSink::default(),
+            ))),
+            "deflate" => Some(MetricsDecoder::Deflate(flate2::write::ZlibDecoder::new(
+                MetricsSink::default(),
+            ))),
+            _ => None,
+        };
+        let disabled = decoder.is_none();
+        Self {
+            decoder: decoder.unwrap_or_else(|| MetricsDecoder::Plain(MetricsSink::default())),
+            disabled,
+        }
+    }
+
+    fn sink_mut(&mut self) -> &mut MetricsSink {
+        match &mut self.decoder {
+            MetricsDecoder::Plain(sink) => sink,
+            MetricsDecoder::Zstd(decoder) => decoder.get_mut(),
+            MetricsDecoder::Gzip(decoder) => decoder.get_mut(),
+            MetricsDecoder::Deflate(decoder) => decoder.get_mut(),
+        }
+    }
+
+    pub fn observe(&mut self, bytes: &[u8], elapsed_ms: u128, is_sse: bool) {
+        use std::io::Write;
+        if self.disabled {
+            return;
+        }
+        let sink = self.sink_mut();
+        sink.elapsed_ms = elapsed_ms;
+        sink.is_sse = is_sse;
+        let writer: &mut dyn Write = match &mut self.decoder {
+            MetricsDecoder::Plain(sink) => sink,
+            MetricsDecoder::Zstd(decoder) => decoder,
+            MetricsDecoder::Gzip(decoder) => decoder,
+            MetricsDecoder::Deflate(decoder) => decoder,
+        };
+        if writer.write_all(bytes).and_then(|()| writer.flush()).is_err() {
+            // A statistics decoding failure must not interrupt forwarding or
+            // turn a successful HTTP request into a network error.
+            self.disabled = true;
+            self.sink_mut().metrics = ResponseMetrics::default();
+        }
+    }
+
+    pub fn finish(&mut self, elapsed_ms: u128) {
+        if !self.disabled {
+            self.sink_mut().metrics.finish(elapsed_ms);
+        }
+    }
+}
+
+impl std::ops::Deref for ResponseBodyMetrics {
+    type Target = ResponseMetrics;
+
+    fn deref(&self) -> &Self::Target {
+        let sink = match &self.decoder {
+            MetricsDecoder::Plain(sink) => sink,
+            MetricsDecoder::Zstd(decoder) => decoder.get_ref(),
+            MetricsDecoder::Gzip(decoder) => decoder.get_ref(),
+            MetricsDecoder::Deflate(decoder) => decoder.get_ref(),
+        };
+        &sink.metrics
+    }
+}
+
+impl ResponseMetrics {
+    pub fn observe(&mut self, chunk: &[u8], elapsed_ms: u128, is_sse: bool) {
+        self.is_sse = is_sse;
+        if !is_sse {
+            if !self.skip_event && self.data.len() + chunk.len() <= 128 * 1024 {
+                self.data.extend_from_slice(chunk);
+            } else {
+                self.data.clear();
+                self.skip_event = true;
+            }
+            return;
+        }
+        // Handle LF, CRLF, CR and arbitrary network/UTF-8 chunk boundaries. Bound
+        // inspection memory per event, and recover after oversized events.
+        for &byte in chunk {
+            if byte == b'\n' && self.after_cr {
+                self.after_cr = false;
+                continue;
+            }
+            self.after_cr = byte == b'\r';
+            if byte == b'\n' || byte == b'\r' {
+                if self.line.is_empty() {
+                    if !self.skip_event {
+                        let data = std::mem::take(&mut self.data);
+                        self.observe_event(&data, elapsed_ms);
+                    }
+                    self.data.clear();
+                    self.skip_event = false;
+                } else {
+                    if let Some(value) = self.line.strip_prefix(b"data:") {
+                        let value = value.strip_prefix(b" ").unwrap_or(value);
+                        if self.data.len() + value.len() + 1 <= 128 * 1024 {
+                            self.data.extend_from_slice(value);
+                            self.data.push(b'\n');
+                        } else {
+                            self.skip_event = true;
+                        }
+                    }
+                    self.line.clear();
+                }
+            } else if self.line.len() < 128 * 1024 {
+                self.line.push(byte);
+            } else {
+                self.skip_event = true;
+            }
+        }
+    }
+
+    pub fn finish(&mut self, elapsed_ms: u128) {
+        if self.is_sse {
+            self.observe(b"\n\n", elapsed_ms, true);
+        } else if !self.skip_event {
+            let data = std::mem::take(&mut self.data);
+            self.observe_event(&data, elapsed_ms);
+        }
+    }
+
+    pub fn first_token_ms(&self) -> Option<u128> {
+        self.first_token_ms
+    }
+
+    pub fn output_tokens(&self) -> Option<u64> {
+        self.output_tokens
+    }
+
+    pub fn completed(&self) -> bool {
+        self.completed
+    }
+
+    fn observe_event(&mut self, event: &[u8], elapsed_ms: u128) {
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(event) else {
+            return;
+        };
+        if self.is_sse && json.get("type").and_then(serde_json::Value::as_str) == Some("response.completed") {
+            self.completed = true;
+        }
+        self.error_kind = match json.get("type").and_then(serde_json::Value::as_str) {
+            Some("response.failed" | "error") => Some("response_failed"),
+            Some("response.incomplete") => Some("response_incomplete"),
+            _ => self.error_kind,
+        };
+        if self.is_sse && self.first_token_ms.is_none() && has_visible_output(&json) {
+            self.first_token_ms = Some(elapsed_ms);
+        }
+        if let Some(tokens) = find_output_tokens(&json) {
+            self.output_tokens = Some(tokens);
+        }
+    }
+}
+
+fn has_visible_output(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let event_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let visible_event = matches!(
+        event_type,
+        "response.output_text.delta"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_text.delta"
+            | "response.audio_transcript.delta"
+            | "response.refusal.delta"
+            | "response.function_call_arguments.delta"
+            | "response.custom_tool_call_input.delta"
+            | "response.image_generation_call.partial_image"
+    );
+    if visible_event {
+        for key in ["delta", "partial_image_b64"] {
+            if object
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+            {
+                return true;
+            }
+        }
+    }
+    let field = match event_type {
+        "response.output_text.done"
+        | "response.reasoning_summary_text.done"
+        | "response.reasoning_text.done"
+        | "response.audio_transcript.done" => Some("text"),
+        "response.function_call_arguments.done" => Some("arguments"),
+        "response.custom_tool_call_input.done" => Some("input"),
+        _ => None,
+    };
+    if field.is_some_and(|key| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    }) {
+        return true;
+    }
+    if matches!(
+        event_type,
+        "response.content_part.added"
+            | "response.content_part.done"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+    ) {
+        return ["/part/text", "/part/transcript"].iter().any(|path| {
+            value
+                .pointer(path)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+        });
+    }
+    false
+}
+
+fn find_output_tokens(value: &serde_json::Value) -> Option<u64> {
+    // Only trust provider usage metadata, never token-shaped fields in output/tool content.
+    let usage = value
+        .pointer("/response/usage")
+        .filter(|usage| usage.is_object())
+        .or_else(|| value.get("usage"))?;
+    usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))?
+        .as_u64()
 }
 
 pub fn push(logs: &mut VecDeque<LogEntry>, entry: LogEntry) {
@@ -214,6 +529,138 @@ pub fn push(logs: &mut VecDeque<LogEntry>, entry: LogEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressed_metrics_parse_fragmented_streams() {
+        use std::io::Write;
+        let events = [
+            b"data: {\"type\":\"response.created\"}\n\n".as_slice(),
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n".as_slice(),
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":120}}}\n\n".as_slice(),
+        ];
+        for encoding in ["zstd", "gzip", "deflate"] {
+            let mut chunks = Vec::new();
+            macro_rules! encode {
+                ($encoder:expr) => {{
+                    let mut encoder = $encoder;
+                    for event in &events[..2] {
+                        encoder.write_all(event).unwrap();
+                        encoder.flush().unwrap();
+                        chunks.push(std::mem::take(encoder.get_mut()));
+                    }
+                    encoder.write_all(events[2]).unwrap();
+                    chunks.push(encoder.finish().unwrap());
+                }};
+            }
+            match encoding {
+                "zstd" => encode!(zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap()),
+                "gzip" => encode!(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast())),
+                _ => encode!(flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast())),
+            }
+            let mut metrics = ResponseBodyMetrics::new(encoding);
+            for (index, chunk) in chunks.iter().enumerate() {
+                for byte in chunk {
+                    metrics.observe(&[*byte], (index as u128 + 1) * 50, true);
+                }
+                assert_eq!(metrics.first_token_ms(), (index > 0).then_some(100), "{encoding}");
+            }
+            metrics.finish(200);
+            assert_eq!(metrics.output_tokens(), Some(120), "{encoding}");
+            assert!(!metrics.disabled, "{encoding}");
+        }
+    }
+
+    #[test]
+    fn unsupported_or_invalid_compression_does_not_invent_metrics() {
+        for encoding in ["br", "gzip, zstd", "zstd", "gzip", "deflate"] {
+            let mut metrics = ResponseBodyMetrics::new(encoding);
+            metrics.observe(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n", 25, true);
+            metrics.finish(50);
+            assert!(metrics.disabled, "{encoding}");
+            assert_eq!(metrics.first_token_ms(), None);
+            assert_eq!(metrics.output_tokens(), None);
+            assert_eq!(metrics.error_kind, None);
+        }
+    }
+
+    #[test]
+    fn sse_metrics_ignore_preamble_and_parse_split_utf8_crlf_and_usage() {
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(
+            b": keepalive\r\ndata: {\"type\":\"response.created\"}\r\n\r\n",
+            10,
+            true,
+        );
+        metrics.observe(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"\"}\n\n",
+            20,
+            true,
+        );
+        assert_eq!(metrics.first_token_ms(), None);
+        let text = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\r\n\r\n";
+        for byte in text.as_bytes() {
+            metrics.observe(&[*byte], 50, true);
+        }
+        metrics.observe(b"data: {\"type\":\"response.completed\",\n", 60, true);
+        metrics.observe(
+            b"data: \"response\":{\"usage\":{\"output_tokens\":120}}}\n\ndata: [DONE]\n\n",
+            70,
+            true,
+        );
+        metrics.finish(80);
+        assert_eq!(metrics.first_token_ms(), Some(50));
+        assert_eq!(metrics.output_tokens(), Some(120));
+    }
+
+    #[test]
+    fn sse_metrics_track_tools_images_and_never_use_output_as_usage() {
+        for event in [
+            r#"{"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
+            r#"{"type":"response.content_part.added","part":{"text":"hi"}}"#,
+            r#"{"type":"response.output_text.done","text":"hi"}"#,
+            r#"{"type":"response.function_call_arguments.delta","delta":"{}"}"#,
+            r#"{"type":"response.custom_tool_call_input.delta","delta":"ls"}"#,
+            r#"{"type":"response.image_generation_call.partial_image","partial_image_b64":"abc"}"#,
+        ] {
+            let mut metrics = ResponseMetrics::default();
+            metrics.observe(format!("data: {event}\n\n").as_bytes(), 25, true);
+            assert_eq!(metrics.first_token_ms(), Some(25));
+        }
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(b"data: {\"output\":{\"output_tokens\":999}}\n\n", 30, true);
+        assert_eq!(metrics.output_tokens(), None);
+    }
+
+    #[test]
+    fn metrics_recover_from_oversized_events_and_keep_memory_bounded() {
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(&vec![b'x'; 512 * 1024], 10, true);
+        assert!(metrics.line.len() <= 128 * 1024);
+        metrics.observe(b"\n\ndata: {\"usage\":{\"output_tokens\":0}}\n\n", 20, true);
+        assert_eq!(metrics.output_tokens(), Some(0));
+        assert_eq!(metrics.first_token_ms(), None);
+    }
+
+    #[test]
+    fn metrics_read_json_usage_without_inventing_nonstream_ttft() {
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(b"{\"usage\":{\"completion_tokens\":42}}", 10, false);
+        metrics.finish(20);
+        assert_eq!(metrics.output_tokens(), Some(42));
+        assert_eq!(metrics.first_token_ms(), None);
+    }
+
+    #[test]
+    fn metrics_capture_sse_error_class_without_error_message() {
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(
+            b"data: {\"type\":\"response.failed\",\"error\":{\"message\":\"private\"}}\n\n",
+            10,
+            true,
+        );
+        assert_eq!(metrics.error_kind, Some("response_failed"));
+        assert_eq!(metrics.first_token_ms(), None);
+    }
 
     #[test]
     fn endpoint_origin_keeps_route_and_drops_credentials() {

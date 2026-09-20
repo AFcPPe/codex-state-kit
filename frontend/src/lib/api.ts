@@ -26,6 +26,9 @@ const emptyTurnState = () => ({
 });
 
 const defaultStatus = (): Status => ({
+  currentAccountId: "mock-account-b",
+  currentAccountEmail: "mock@example.com",
+  accountTraffic: { concurrentRequests: 2, rpm: 18 },
   proxyListen: "127.0.0.1:8787",
   upstream: "https://chatgpt.com/backend-api/codex",
   codexHome: "~/.codex",
@@ -53,11 +56,14 @@ const defaultStatus = (): Status => ({
   degradedAt: null,
   logs: [{
     id: 1,
+    accountId: "mock-account-a",
+    accountEmail: "previous@example.com",
     ts: new Date(Date.now() - 900).toISOString(),
     method: "POST",
     path: "/responses",
     status: 200,
     ms: 263,
+    responseHeaderMs: 263,
     flow: "token_fetch",
     transport: "http_sse",
     targetOrigin: "https://chatgpt.com:443",
@@ -75,11 +81,18 @@ const defaultStatus = (): Status => ({
     errorKind: null,
   }, {
     id: 2,
+    accountId: "mock-account-b",
+    accountEmail: "mock@example.com",
     ts: new Date().toISOString(),
     method: "POST",
     path: "/backend-api/codex/responses",
     status: 200,
-    ms: 184,
+    ms: 12640,
+    responseHeaderMs: 184,
+    firstTokenMs: 1240,
+    outputTokens: 684,
+    tokensPerSecond: 60,
+    inProgress: false,
     flow: "business",
     transport: "http_sse",
     targetOrigin: "https://chatgpt.com:443",
@@ -102,7 +115,7 @@ const defaultLogin = (): LoginStatus => ({
   loggedIn: true,
   authMode: "chatgpt",
   email: "mock@example.com",
-  accountId: "mock-account",
+  accountId: "mock-account-b",
 });
 
 let mockStatus = defaultStatus();
@@ -120,6 +133,7 @@ function cloneStatus(): Status {
   return {
     ...mockStatus,
     warp: { ...mockStatus.warp },
+    accountTraffic: { ...mockStatus.accountTraffic },
     turnState: { ...mockStatus.turnState },
     logs: mockStatus.logs.map((entry) => ({ ...entry })),
   };

@@ -88,7 +88,18 @@ function stateLabel(entry: LogEntry): string {
     case "missing": return "响应未带 state";
     case "rejected_invalid": return "state 无法解析";
     case "rejected_degraded": return "已丢弃降级 state";
-    default: return "不适用";
+    case "rejected_length": return "state 长度不匹配，已拒绝";
+    case "rejected_stale": return "state 超过预取年龄，已拒绝";
+    case "rejected_future": return "state 时间戳超前，已拒绝";
+    case "rejected_status": return "上游状态码异常，已拒绝";
+    case "discarded_stale_config": return "配置已变化，已丢弃旧结果";
+    case "discarded_stale_account": return "账号已切换，已丢弃旧结果";
+    case "removed_account_mismatch": return "账号已切换，已移除旧 state";
+    case "pooled_unmatched": return "已入池，但未匹配当前绑定";
+    case "awaiting_response": return "未收到响应";
+    case "not_applicable":
+    case "": return "不适用";
+    default: return `未知状态（${entry.turnStateAction}）`;
   }
 }
 
@@ -123,18 +134,42 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function logExport(status: Status): string {
+function formatDuration(ms?: number | null): string {
+  if (ms == null) return "—";
+  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`;
+}
+
+function speedLabel(entry: LogEntry): string {
+  return entry.tokensPerSecond == null ? "— tok/s" : `${entry.tokensPerSecond.toFixed(1)} tok/s`;
+}
+
+function accountLabel(status: Status, id?: string | null, email?: string | null): string {
+  if (!id) return "账号未知";
+  return email || (id === status.currentAccountId ? status.currentAccountEmail : null)
+    || status.logs.find((entry) => entry.accountId === id && entry.accountEmail)?.accountEmail
+    || "邮箱未知";
+}
+
+function filteredLogs(status: Status, filter: string): LogEntry[] {
+  if (filter === "all") return status.logs;
+  const account = filter === "current" ? status.currentAccountId : filter.slice(3);
+  return status.logs.filter((entry) => account ? entry.accountId === account : !entry.accountId);
+}
+
+function logExport(status: Status, filter = "all"): string {
   const routeLines = [
     `Token 获取: ${ticketRoute(status).join(" -> ")}`,
     `业务请求: ${businessRoute(status).join(" -> ")}`,
   ];
-  const entries = status.logs.map((entry) => [
-    `[${entry.ts}] ${requestLabel(entry)} -> ${entry.status} (${entry.ms}ms)`,
+  const entries = filteredLogs(status, filter).map((entry) => [
+    `[${entry.ts}] ${requestLabel(entry)} -> ${entry.status} (${entry.inProgress ? "in progress" : `${entry.ms}ms`})`,
+    `  account=${accountLabel(status, entry.accountId, entry.accountEmail)}`,
     `  model=${entry.model || "unknown"} transport=${transportLabel(entry.transport)} route=${routeLabel(entry)}`,
     `  peer=${entry.peerAddr || "unknown"} final=${entry.finalOrigin || "unknown"} http=${entry.httpVersion || "unknown"}`,
+    `  responseHeaderMs=${entry.responseHeaderMs ?? "unknown"} responseEncoding=${entry.responseContentEncoding ?? "unknown"} firstTokenMs=${entry.firstTokenMs ?? "unknown"} totalMs=${entry.inProgress ? "pending" : entry.ms} outputTokens=${entry.outputTokens ?? "unknown"} tokensPerSecond=${entry.tokensPerSecond?.toFixed(1) ?? "unknown"} inProgress=${Boolean(entry.inProgress)}`,
     `  state=${stateLabel(entry)} returnedState=${entry.returnedTurnStateLen || 0} body=${formatBytes(entry.bodyBytes)} encoding=${entry.contentEncoding || "none"} error=${entry.errorKind || "none"}`,
   ].join("\n"));
-  return [...routeLines, "", ...entries].join("\n");
+  return [...routeLines, `账号筛选: ${filter === "all" ? "全部账号" : filter === "current" ? `当前账号 ${accountLabel(status, status.currentAccountId)}` : accountLabel(status, filter.slice(3))}`, "", ...entries].join("\n");
 }
 
 function RouteLine({ icon, label, nodes }: { icon: "ticket" | "business"; label: string; nodes: string[] }) {
@@ -158,6 +193,7 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
   const dialogRef = useRef<HTMLDialogElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const [copyState, setCopyState] = useState<"idle" | "done" | "error">("idle");
+  const [accountFilter, setAccountFilter] = useState("all");
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -180,14 +216,17 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
 
   const copyLogs = async () => {
     try {
-      await navigator.clipboard.writeText(logExport(status));
+      await navigator.clipboard.writeText(logExport(status, accountFilter));
       setCopyState("done");
     } catch {
       setCopyState("error");
     }
   };
 
-  const entries = [...status.logs].reverse();
+  const entries = [...filteredLogs(status, accountFilter)].reverse();
+  const accounts = [...new Set(status.logs.map((entry) => entry.accountId).filter((id): id is string => Boolean(id)))];
+  const selectedAccount = accountFilter.startsWith("id:") ? accountFilter.slice(3) : null;
+  if (selectedAccount && !accounts.includes(selectedAccount)) accounts.push(selectedAccount);
   return (
     <dialog
       ref={dialogRef}
@@ -227,6 +266,18 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
           <RouteLine icon="business" label="业务请求" nodes={businessRoute(status)} />
         </section>
 
+        <div className="network-log-filter">
+          <label>账号
+            <select aria-label="筛选日志账号" value={accountFilter} onChange={(event) => { setAccountFilter(event.target.value); setCopyState("idle"); }}>
+              <option value="all">全部账号</option>
+              <option value="current" disabled={!status.currentAccountId}>当前账号 · {accountLabel(status, status.currentAccountId)}</option>
+              {accounts.map((id) => <option key={id} value={`id:${id}`}>{accountLabel(status, id)}</option>)}
+              <option value="id:">账号未知</option>
+            </select>
+          </label>
+          <span>{entries.length} / {status.logs.length} 条 · 按请求发起时的账号记录</span>
+        </div>
+
         <div className="network-log-table-wrap">
           {entries.length ? (
             <table className="network-log-table">
@@ -234,9 +285,9 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
                 <tr>
                   <th scope="col">时间</th>
                   <th scope="col">请求</th>
+                  <th scope="col">结果 / 性能</th>
                   <th scope="col">网络路径</th>
                   <th scope="col">Turn-State</th>
-                  <th scope="col">结果</th>
                 </tr>
               </thead>
               <tbody>
@@ -245,7 +296,19 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
                     <td className="network-log-table__time" title={entry.ts}>{displayTime(entry.ts)}</td>
                     <td>
                       <strong>{requestLabel(entry)}</strong>
+                      <small title={accountLabel(status, entry.accountId, entry.accountEmail)}>账号 {accountLabel(status, entry.accountId, entry.accountEmail)}{entry.accountId && entry.accountId === status.currentAccountId ? " · 当前" : ""}</small>
                       <small>{entry.flow === "token_fetch" ? `${entry.method} ${entry.path} · ` : ""}{entry.model || "模型未识别"} · {transportLabel(entry.transport)}</small>
+                    </td>
+                    <td>
+                      <span className={`network-log-status${entry.status >= 400 || entry.errorKind ? " network-log-status--error" : ""}`}>{entry.status}{entry.inProgress ? " · 进行中" : ""}</span>
+                      {entry.flow !== "token_fetch" ? (
+                        <>
+                          <small title="从请求进入代理到首个非空文本、工具参数或图片输出事件；不包含响应头、心跳与预置事件。">首字 {formatDuration(entry.firstTokenMs)} · {speedLabel(entry)}</small>
+                          <small title="总耗时统计至响应体结束；tok/s = 上游输出 token 数 ÷（总耗时 − 首字延迟）。">总耗时 {entry.inProgress ? "进行中" : formatDuration(entry.ms)}{entry.outputTokens != null ? ` · ${entry.outputTokens} tokens` : ""}</small>
+                        </>
+                      ) : null}
+                      <small>{entry.httpVersion || "HTTP"} · 响应头 {formatDuration(entry.responseHeaderMs ?? (entry.flow === "token_fetch" ? entry.ms : null))}{entry.errorKind ? ` · ${entry.errorKind}` : ""}</small>
+                      {entry.responseContentEncoding && entry.responseContentEncoding !== "none" && <small>响应编码 {entry.responseContentEncoding}</small>}
                     </td>
                     <td>
                       <span>{routeLabel(entry)}</span>
@@ -255,10 +318,6 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
                       <span>{stateLabel(entry)}</span>
                       <small>{returnedStateLabel(entry)} · {formatBytes(entry.bodyBytes)} · {entry.contentEncoding || "none"}</small>
                     </td>
-                    <td>
-                      <span className={`network-log-status${entry.status >= 400 ? " network-log-status--error" : ""}`}>{entry.status}</span>
-                      <small>{entry.httpVersion || "HTTP"} · 响应头 {entry.ms} ms{entry.errorKind ? ` · ${entry.errorKind}` : ""}</small>
-                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -266,7 +325,7 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
           ) : (
             <div className="network-log-dialog__empty">
               <Route size={24} strokeWidth={1.5} />
-              <strong>等待第一条请求</strong>
+              <strong>{status.logs.length ? "该账号暂无请求记录" : "等待第一条请求"}</strong>
               <p>Token 获取和 Codex 业务请求会记录在这里。</p>
             </div>
           )}

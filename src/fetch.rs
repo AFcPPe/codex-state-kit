@@ -167,6 +167,8 @@ pub(crate) async fn fetch_turn_state_with_log(
         model,
     );
     let probe = probe_body(model);
+    details.account_id = Some(logs::safe_text(&creds.account_id, 128));
+    details.account_email = creds.email.as_deref().map(|email| logs::safe_text(email, 254));
     details.body_bytes = serde_json::to_vec(&probe)
         .map(|body| body.len())
         .unwrap_or(0);
@@ -342,6 +344,7 @@ mod tests {
 
     fn creds() -> ChatGptCredentials {
         ChatGptCredentials {
+            email: Some("test@example.com".into()),
             access_token: "access".into(),
             account_id: "acct".into(),
         }

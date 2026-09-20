@@ -3,6 +3,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, Version};
 use axum::response::{IntoResponse, Response};
+use futures_util::StreamExt;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -19,6 +20,7 @@ use crate::attach::{self, is_attached};
 use crate::fetch;
 use crate::login::{self, has_chatgpt_login};
 use crate::logs::{self, LogEntry, NetworkLogDetails};
+use crate::traffic::{AccountTraffic, RequestActivity, TrafficTracker};
 use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch};
 use crate::turn_state::{self, TurnStateStore, TurnStateView};
 use crate::warp::{WarpRuntime, WarpStatus};
@@ -140,12 +142,16 @@ pub struct Status {
     pub degraded: bool,
     pub degraded_at: Option<String>,
     pub logs: Vec<LogEntry>,
+    pub account_traffic: AccountTraffic,
+    pub current_account_id: Option<String>,
+    pub current_account_email: Option<String>,
 }
 
 pub struct App {
     pub warp: WarpRuntime,
     pub settings: Mutex<Settings>,
     pub logs: Mutex<VecDeque<LogEntry>>,
+    traffic: TrafficTracker,
     pub proxy_ok: AtomicBool,
     pub login_http: reqwest::Client,
     leftover_restored: AtomicBool,
@@ -181,6 +187,7 @@ impl App {
             warp,
             settings: Mutex::new(settings),
             logs: Mutex::new(VecDeque::with_capacity(80)),
+            traffic: TrafficTracker::default(),
             proxy_ok: AtomicBool::new(false),
             login_http: crate::login::http_client()?,
             leftover_restored: AtomicBool::new(false),
@@ -234,6 +241,9 @@ impl App {
         self.sync_logged_in_account().await;
         let settings = self.settings.lock().await.clone();
         let logs = self.logs.lock().await.iter().cloned().collect();
+        let login_status = login::login_status(Path::new(&settings.codex_home));
+        let account = login_status.account_id;
+        let account_traffic = self.traffic.view(account.as_deref(), Instant::now());
         let attached = is_attached(
             Path::new(&settings.codex_home),
             &format!("http://{}", settings.proxy_listen),
@@ -257,6 +267,9 @@ impl App {
             degraded: self.degraded.load(Ordering::Relaxed),
             degraded_at: self.degraded_at.lock().await.clone(),
             logs,
+            account_traffic,
+            current_account_id: account,
+            current_account_email: login_status.email,
         }
     }
 
@@ -409,6 +422,9 @@ impl App {
                 let message = format!("[{model}] 配置已变化，取消旧线路票据请求");
                 return Err(FetchOnceError::new(message, FetchRetryClass::Stale));
             }
+            if !fetch_account_is_current(&settings, &creds.account_id) {
+                return Err(FetchOnceError::new(format!("[{model}] 登录账号已变化，取消旧账号票据请求"), FetchRetryClass::Stale));
+            }
             let client = match fetch::http_client(&settings.outbound_proxy) {
                 Ok(client) => client,
                 Err(err) => {
@@ -431,6 +447,11 @@ impl App {
             )
             .await;
 
+            if !fetch_account_is_current(&settings, &creds.account_id) {
+                details.turn_state_action = "discarded_stale_account".into();
+                self.record_fetch(started, details).await;
+                return Err(FetchOnceError::new(format!("[{model}] 登录账号已变化，丢弃旧账号票据结果"), FetchRetryClass::Stale));
+            }
             match result {
                 Ok(token) => {
                     if self.fetch_generation.load(Ordering::SeqCst) != generation {
@@ -1006,22 +1027,210 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
     let method = req.method().clone();
     let path = logs::safe_text(req.uri().path(), 256);
     let mut details = NetworkLogDetails::default();
-    match forward_http_with_log(&app, req, &mut details).await {
+    let mut activity = None;
+    match forward_http_tracked(&app, req, &mut details, &mut activity).await {
         Ok(resp) => {
-            app.record(
+            details.response_header_ms = Some(started.elapsed().as_millis());
+            details.response_content_encoding = Some(logs::safe_content_encoding(
+                resp.headers().get(header::CONTENT_ENCODING).and_then(|value| value.to_str().ok()),
+            ));
+            if method == http::Method::HEAD
+                || matches!(resp.status().as_u16(), 204 | 304)
+                || resp
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .is_some_and(|value| value == "0")
+            {
+                app.record(
+                    method.as_str(),
+                    &path,
+                    resp.status().as_u16(),
+                    started,
+                    details,
+                )
+                .await;
+                return resp;
+            }
+            details.in_progress = true;
+            // Some Codex upstream responses omit Content-Type despite sending
+            // SSE. Retain the request's explicit SSE negotiation in that case.
+            let is_sse = details.transport == "http_sse" || resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value
+                        .split(';')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .eq_ignore_ascii_case("text/event-stream")
+                });
+            if is_sse {
+                details.transport = "http_sse".into();
+            }
+            let metrics = logs::ResponseBodyMetrics::new(resp
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .map(|value| value.to_str().unwrap_or("unsupported"))
+                .unwrap_or_default());
+            let remaining_bytes = resp
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            let entry = LogEntry::new(
                 method.as_str(),
                 &path,
                 resp.status().as_u16(),
                 started,
                 details,
-            )
-            .await;
-            resp
+            );
+            logs::push(&mut *app.logs.lock().await, entry.clone());
+            let tracker = ResponseLogTracker {
+                app,
+                entry,
+                started,
+                metrics,
+                finished: false,
+                remaining_bytes,
+                activity,
+            };
+            let (parts, body) = resp.into_parts();
+            let stream = futures_util::stream::unfold(
+                (body.into_data_stream(), tracker),
+                move |(mut stream, mut tracker)| async move {
+                    if tracker.finished {
+                        return None;
+                    }
+                    let next = stream.next().await;
+                    match &next {
+                        Some(Ok(bytes)) => {
+                            tracker.metrics.observe(
+                                bytes,
+                                tracker.started.elapsed().as_millis(),
+                                is_sse,
+                            );
+                            // Hyper may stop polling immediately after Content-Length
+                            // bytes. That is completion, not client cancellation.
+                            if let Some(remaining) = &mut tracker.remaining_bytes {
+                                *remaining = remaining.saturating_sub(bytes.len() as u64);
+                                if *remaining == 0 {
+                                    tracker
+                                        .metrics
+                                        .finish(tracker.started.elapsed().as_millis());
+                                    tracker.finished = true;
+                                }
+                            }
+                        }
+                        Some(Err(_)) => {
+                            tracker.entry.error_kind = Some("response_body".into());
+                            tracker.finished = true;
+                        }
+                        None => {
+                            tracker
+                                .metrics
+                                .finish(tracker.started.elapsed().as_millis());
+                            tracker.finished = true;
+                        }
+                    }
+                    if tracker.finished {
+                        tracker.activity.take();
+                    }
+                    // No read-ahead or buffering for forwarding. Only publish metric changes
+                    // and the final result; response bytes are passed through unchanged.
+                    if tracker.finished
+                        || tracker.entry.first_token_ms != tracker.metrics.first_token_ms()
+                        || tracker.entry.output_tokens != tracker.metrics.output_tokens()
+                        || tracker.entry.error_kind.as_deref() != tracker.metrics.error_kind
+                    {
+                        tracker.refresh();
+                        tracker.publish().await;
+                    }
+                    next.map(|item| (item, (stream, tracker)))
+                },
+            );
+            Response::from_parts(parts, Body::from_stream(stream))
         }
         Err(err) => {
             app.record(method.as_str(), &path, 502, started, details)
                 .await;
             (StatusCode::BAD_GATEWAY, err.to_string()).into_response()
+        }
+    }
+}
+
+fn fetch_account_is_current(settings: &Settings, account: &str) -> bool {
+    login::chatgpt_credentials(Path::new(&settings.codex_home))
+        .is_ok_and(|creds| creds.account_id == account)
+}
+
+struct ResponseLogTracker {
+    app: Arc<App>,
+    entry: LogEntry,
+    started: Instant,
+    metrics: logs::ResponseBodyMetrics,
+    finished: bool,
+    remaining_bytes: Option<u64>,
+    activity: Option<RequestActivity>,
+}
+
+impl ResponseLogTracker {
+    fn refresh(&mut self) {
+        self.entry.ms = self.started.elapsed().as_millis();
+        self.entry.first_token_ms = self.metrics.first_token_ms();
+        self.entry.output_tokens = self.metrics.output_tokens();
+        self.entry.in_progress = !self.finished;
+        if self.entry.error_kind.is_none() {
+            self.entry.error_kind = self.metrics.error_kind.map(str::to_owned);
+        }
+        self.entry.tokens_per_second = if self.finished && self.entry.error_kind.is_none() {
+            self.entry
+                .output_tokens
+                .zip(self.entry.first_token_ms)
+                .and_then(|(tokens, first)| {
+                    let generation_ms = self.entry.ms.saturating_sub(first);
+                    (generation_ms > 0).then(|| tokens as f64 * 1000.0 / generation_ms as f64)
+                })
+        } else {
+            None
+        };
+    }
+
+    async fn publish(&self) {
+        replace_network_log(&self.app, self.entry.clone()).await;
+    }
+}
+
+async fn replace_network_log(app: &App, entry: LogEntry) {
+    if let Some(existing) = app
+        .logs
+        .lock()
+        .await
+        .iter_mut()
+        .find(|existing| existing.id == entry.id)
+    {
+        *existing = entry;
+    }
+}
+
+impl Drop for ResponseLogTracker {
+    fn drop(&mut self) {
+        if !self.finished {
+            if !self.metrics.completed() && self.metrics.error_kind.is_none() {
+                self.entry.error_kind = Some("client_cancelled".into());
+            }
+            self.finished = true;
+            self.refresh();
+        }
+        // A disconnected client drops the body without polling EOF. Preserve that
+        // partial request too, without continuing to read the upstream response.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let app = self.app.clone();
+            let entry = self.entry.clone();
+            runtime.spawn(async move {
+                replace_network_log(&app, entry).await;
+            });
         }
     }
 }
@@ -1047,10 +1256,20 @@ async fn forward_http(app: &App, req: Request<Body>) -> Result<Response> {
     forward_http_with_log(app, req, &mut details).await
 }
 
+#[cfg(test)]
 async fn forward_http_with_log(
     app: &App,
     req: Request<Body>,
     details: &mut NetworkLogDetails,
+) -> Result<Response> {
+    forward_http_tracked(app, req, details, &mut None).await
+}
+
+async fn forward_http_tracked(
+    app: &App,
+    req: Request<Body>,
+    details: &mut NetworkLogDetails,
+    activity: &mut Option<RequestActivity>,
 ) -> Result<Response> {
     let (upstream, home, upstream_proxy, http) = {
         let settings = app.settings.lock().await;
@@ -1098,6 +1317,16 @@ async fn forward_http_with_log(
         should_stamp
     ));
 
+    let client_account = request_account(&parts.headers);
+    let applied_account = login::apply_kit_auth_headers(&mut parts.headers, Path::new(&home));
+    let effective_account = request_account(&parts.headers);
+    let account_changed = applied_account.is_some() && client_account != effective_account;
+    details.account_id = effective_account.as_deref().map(|id| logs::safe_text(id, 128));
+    let account_snapshot = applied_account.unwrap_or_else(|| login::login_status(Path::new(&home)));
+    if effective_account.is_some() && account_snapshot.account_id == effective_account {
+        details.account_email = account_snapshot.email.map(|email| logs::safe_text(&email, 254));
+    }
+
     let mut injected_token: Option<String> = None;
     if should_stamp {
         let request_model = turn_state::extract_model_from_body(&bytes);
@@ -1125,9 +1354,9 @@ async fn forward_http_with_log(
         let client_already_has = turn_state::has_http_turn_state(&parts.headers);
         if client_already_has {
             let store = app.turn_state.lock().await;
-            // 严格按模型取 token — 不同模型的 token 不可混用
-            let token = if let Some(ref model) = request_model {
-                store.peek_for_model(model)
+            // Match the immutable outgoing credential snapshot, not the latest UI account.
+            let token = if effective_account.as_deref().is_some_and(|id| store.is_bound_to_account(id)) {
+                request_model.as_deref().and_then(|model| store.peek_for_model(model))
             } else {
                 // 无法识别模型时不注入，保留客户端原 token
                 None
@@ -1144,6 +1373,9 @@ async fn forward_http_with_log(
                     path
                 );
                 injected_token = Some(token);
+            } else if account_changed {
+                parts.headers.remove(turn_state::HEADER_NAME);
+                details.turn_state_action = "removed_account_mismatch".into();
             } else {
                 details.turn_state_action = if request_model.is_some() {
                     "preserved_no_ticket".into()
@@ -1172,7 +1404,6 @@ async fn forward_http_with_log(
     } else {
         details.turn_state_action = "not_applicable".into();
     }
-    login::apply_kit_auth_headers(&mut parts.headers, Path::new(&home));
     let mut builder = http
         .request(
             reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?,
@@ -1184,6 +1415,15 @@ async fn forward_http_with_log(
             continue;
         }
         builder = builder.header(name, value);
+    }
+    if let Some(account) = parts
+        .headers
+        .get("chatgpt-account-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        *activity = Some(app.traffic.begin(account, Instant::now()));
     }
     let upstream_resp = match builder.send().await {
         Ok(response) => response,
@@ -1261,6 +1501,11 @@ fn is_hop(name: &HeaderName) -> bool {
         .any(|h| name.as_str().eq_ignore_ascii_case(h))
 }
 
+fn request_account(headers: &HeaderMap) -> Option<String> {
+    headers.get("chatgpt-account-id").and_then(|value| value.to_str().ok())
+        .map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned)
+}
+
 pub fn join_upstream(upstream: &str, uri: &Uri) -> Result<String> {
     let mut base = upstream.trim().to_string();
     if !base.ends_with('/') {
@@ -1276,6 +1521,10 @@ pub fn join_upstream(upstream: &str, uri: &Uri) -> Result<String> {
 #[cfg(test)]
 #[path = "upstream_proxy_tests.rs"]
 mod upstream_proxy_tests;
+
+#[cfg(test)]
+#[path = "account_switch_tests.rs"]
+mod account_switch_tests;
 
 #[cfg(test)]
 mod tests {

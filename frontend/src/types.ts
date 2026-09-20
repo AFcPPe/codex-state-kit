@@ -1,10 +1,18 @@
 export interface LogEntry {
+  accountId?: string | null;
+  accountEmail?: string | null;
   id: number;
   ts: string;
   method: string;
   path: string;
   status: number;
   ms: number;
+  responseHeaderMs?: number | null;
+  responseContentEncoding?: string | null;
+  firstTokenMs?: number | null;
+  outputTokens?: number | null;
+  tokensPerSecond?: number | null;
+  inProgress?: boolean;
   flow: string;
   transport: string;
   targetOrigin: string;
@@ -57,6 +65,9 @@ export interface TurnStateView {
 }
 
 export interface Status {
+  currentAccountId?: string | null;
+  currentAccountEmail?: string | null;
+  accountTraffic: { concurrentRequests: number; rpm: number };
   proxyListen: string;
   upstream: string;
   codexHome: string;

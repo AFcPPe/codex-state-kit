@@ -3,6 +3,7 @@ pub mod fetch;
 pub mod login;
 pub mod browser_login;
 pub mod logs;
+pub mod traffic;
 pub mod proxy;
 pub mod settings;
 pub mod turn_state;

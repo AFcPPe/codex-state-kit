@@ -217,11 +217,19 @@ async fn upstream_proxy_hot_update_and_failures() {
             app.clone(),
             Request::builder()
                 .uri("/check?token=must-not-enter-log")
+                .header("chatgpt-account-id", "failed-account")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            app.traffic.view(Some("failed-account"), Instant::now()),
+            AccountTraffic {
+                concurrent_requests: 0,
+                rpm: 1
+            }
+        );
         let failed_log = app.logs.lock().await.back().cloned().unwrap();
         assert_eq!(failed_log.route_kind, logs::ROUTE_EXPLICIT_PROXY);
         assert_eq!(failed_log.path, "/check");
@@ -248,9 +256,239 @@ async fn upstream_proxy_hot_update_and_failures() {
             .await
             .upstream_proxy
             .is_empty());
+        verify_response_metrics().await;
     })
     .await
     .unwrap();
+}
+
+// Runs inside the isolated HOME/proxy environment above; never calls a public upstream.
+async fn verify_response_metrics() {
+    use futures_util::StreamExt;
+    for outcome in [
+        "complete",
+        "length",
+        "zstd",
+        "zstd_length",
+        "no_content_type",
+        "no_content_type_completed_drop",
+        "cancel",
+        "body_error",
+        "cancel_headers",
+    ] {
+        let preamble = b"data: {\"type\":\"response.created\"}\n\n";
+        let delta = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
+        let end = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":120}}}\n\ndata: [DONE]\n\n";
+        let compressed = outcome.starts_with("zstd");
+        let (preamble, delta, end) = if compressed {
+            use std::io::Write;
+            let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+            encoder.write_all(preamble).unwrap();
+            encoder.flush().unwrap();
+            let preamble = std::mem::take(encoder.get_mut());
+            encoder.write_all(delta).unwrap();
+            encoder.flush().unwrap();
+            let delta = std::mem::take(encoder.get_mut());
+            encoder.write_all(end).unwrap();
+            (preamble, delta, encoder.finish().unwrap())
+        } else {
+            (preamble.to_vec(), delta.to_vec(), end.to_vec())
+        };
+        let body_length = preamble.len() + delta.len() + end.len();
+        let fixed_length = outcome.ends_with("length");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (send, mut recv) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let (received_tx, received_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let app = Arc::new(
+            App::new(Settings {
+                upstream: format!("http://{}", listener.local_addr().unwrap()),
+                upstream_proxy: String::new(),
+                codex_home: crate::settings::home_dir().display().to_string(),
+                ..Settings::default()
+            })
+            .unwrap(),
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_headers(&mut socket).await;
+            received_tx.send(()).unwrap();
+            if release_rx.await.is_err() {
+                return;
+            }
+            let framing = if fixed_length {
+                format!(
+                    "Content-Length: {}",
+                    body_length
+                )
+            } else {
+                "Transfer-Encoding: chunked".into()
+            };
+            let encoding = if compressed { "Content-Encoding: zstd\r\n" } else { "" };
+            let content_type = if outcome.starts_with("no_content_type") { "" } else { "Content-Type: text/event-stream\r\n" };
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\n{content_type}{encoding}{framing}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            while let Some(bytes) = recv.recv().await {
+                if bytes.is_empty() {
+                    return;
+                } // Intentional premature upstream EOF.
+                if !fixed_length {
+                    socket
+                        .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+                        .await
+                        .unwrap();
+                }
+                socket.write_all(&bytes).await.unwrap();
+                if !fixed_length {
+                    socket.write_all(b"\r\n").await.unwrap();
+                }
+            }
+            if !fixed_length {
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+            }
+        });
+        let request = tokio::spawn(proxy_http(
+            app.clone(),
+            Request::builder()
+                .uri("/metrics")
+                .header("accept", "text/event-stream")
+                .header("chatgpt-account-id", "metrics-account")
+                .body(Body::empty())
+                .unwrap(),
+        ));
+        received_rx.await.unwrap();
+        assert_eq!(
+            app.traffic.view(Some("metrics-account"), Instant::now()),
+            AccountTraffic {
+                concurrent_requests: 1,
+                rpm: 1
+            }
+        );
+        if outcome == "cancel_headers" {
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            assert_eq!(
+                app.traffic.view(Some("metrics-account"), Instant::now()),
+                AccountTraffic {
+                    concurrent_requests: 0,
+                    rpm: 1
+                }
+            );
+            drop(release_tx);
+            server.await.unwrap();
+            continue;
+        }
+        release_tx.send(()).unwrap();
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        if compressed {
+            assert_eq!(response.headers()[header::CONTENT_ENCODING], "zstd");
+        }
+        let initial = app.logs.lock().await.back().cloned().unwrap();
+        assert!(initial.in_progress);
+        assert!(initial.first_token_ms.is_none());
+        let mut stream = response.into_body().into_data_stream();
+        send.send(preamble.to_vec()).await.unwrap();
+        assert_eq!(&stream.next().await.unwrap().unwrap()[..], preamble);
+        assert!(app
+            .logs
+            .lock()
+            .await
+            .back()
+            .unwrap()
+            .first_token_ms
+            .is_none());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        send.send(delta.to_vec()).await.unwrap();
+        assert_eq!(&stream.next().await.unwrap().unwrap()[..], delta);
+        let live = app.logs.lock().await.back().cloned().unwrap();
+        assert!(live.in_progress);
+        assert_eq!(
+            app.traffic
+                .view(Some("metrics-account"), Instant::now())
+                .concurrent_requests,
+            1
+        );
+        assert!(live.first_token_ms.unwrap() >= initial.response_header_ms.unwrap() + 20);
+        assert!(live.tokens_per_second.is_none());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        match outcome {
+            "complete" | "length" | "zstd" | "zstd_length" | "no_content_type" | "no_content_type_completed_drop" => {
+                send.send(end.to_vec()).await.unwrap();
+                let mut forwarded = Vec::new();
+                if outcome.ends_with("completed_drop") {
+                    // Codex stops reading at response.completed, before HTTP EOF.
+                    forwarded.extend_from_slice(&stream.next().await.unwrap().unwrap());
+                    drop(stream);
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        while app.logs.lock().await.back().unwrap().in_progress {
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.unwrap();
+                    drop(send);
+                } else {
+                    drop(send);
+                    while let Some(bytes) = stream.next().await {
+                        forwarded.extend_from_slice(&bytes.unwrap());
+                    }
+                }
+                assert_eq!(forwarded, end);
+                let logs = app.logs.lock().await;
+                assert_eq!(logs.len(), 1);
+                let entry = logs.back().unwrap();
+                assert!(!entry.in_progress);
+                assert_eq!(entry.id, initial.id);
+                assert_eq!(entry.output_tokens, Some(120));
+                assert!(entry.ms > entry.first_token_ms.unwrap());
+                assert_eq!(
+                    entry.tokens_per_second,
+                    Some(120000.0 / (entry.ms - entry.first_token_ms.unwrap()) as f64)
+                );
+                assert!(entry.error_kind.is_none());
+            }
+            "cancel" => {
+                drop(stream);
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if !app.logs.lock().await.back().unwrap().in_progress {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let entry = app.logs.lock().await.back().cloned().unwrap();
+                assert_eq!(entry.error_kind.as_deref(), Some("client_cancelled"));
+                assert!(entry.first_token_ms.is_some());
+                assert!(entry.tokens_per_second.is_none());
+                drop(send);
+            }
+            _ => {
+                send.send(Vec::new()).await.unwrap();
+                assert!(stream.next().await.unwrap().is_err());
+                let entry = app.logs.lock().await.back().cloned().unwrap();
+                assert!(!entry.in_progress);
+                assert_eq!(entry.error_kind.as_deref(), Some("response_body"));
+                assert!(entry.tokens_per_second.is_none());
+            }
+        }
+        server.await.unwrap();
+        assert_eq!(
+            app.traffic.view(Some("metrics-account"), Instant::now()),
+            AccountTraffic {
+                concurrent_requests: 0,
+                rpm: 1
+            }
+        );
+    }
 }
 
 #[tokio::test]

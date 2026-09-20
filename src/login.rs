@@ -250,6 +250,7 @@ pub fn has_chatgpt_login(home: &Path) -> bool {
 pub(crate) struct ChatGptCredentials {
     pub access_token: String,
     pub account_id: String,
+    pub email: Option<String>,
 }
 
 pub(crate) fn chatgpt_credentials(home: &Path) -> Result<ChatGptCredentials> {
@@ -291,31 +292,39 @@ fn credentials_from_auth(auth: &Value) -> Result<ChatGptCredentials> {
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let id_token = tokens.get("id_token").and_then(Value::as_str).unwrap_or("");
-    let (jwt_account, _) = extract_account_metadata(id_token, &access_token);
+    let (jwt_account, email) = extract_account_metadata(id_token, &access_token);
     let account_id = jwt_account
         .or(stored_account)
         .ok_or_else(|| anyhow::anyhow!("无法从登录文件提取 chatgpt_account_id"))?;
     Ok(ChatGptCredentials {
         access_token,
         account_id,
+        email,
     })
 }
 
 /// Kit 已独立登录时，用 Kit 账号替换转发请求上的鉴权头，官方客户端无需重启。
-pub fn apply_kit_auth_headers(headers: &mut HeaderMap, home: &Path) {
-    if !has_kit_session(home) {
-        return;
-    }
-    let Ok(creds) = chatgpt_credentials(home) else {
-        return;
+pub fn apply_kit_auth_headers(headers: &mut HeaderMap, home: &Path) -> Option<LoginStatus> {
+    // Read one immutable credential snapshot and validate both headers before
+    // replacing either. A concurrent login must never split token and account.
+    let Ok(Some(creds)) = credentials_from_file(&kit_auth_path(home)) else {
+        return None;
     };
-    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", creds.access_token)) {
-        headers.insert(http::header::AUTHORIZATION, value);
-    }
-    if let Ok(value) = HeaderValue::from_str(&creds.account_id) {
-        headers.insert(HeaderName::from_static("chatgpt-account-id"), value);
-    }
+    let (Ok(auth), Ok(account)) = (
+        HeaderValue::from_str(&format!("Bearer {}", creds.access_token)),
+        HeaderValue::from_str(&creds.account_id),
+    ) else {
+        return None;
+    };
+    headers.insert(http::header::AUTHORIZATION, auth);
+    headers.insert(HeaderName::from_static("chatgpt-account-id"), account);
     headers.remove(http::header::COOKIE);
+    Some(LoginStatus {
+        logged_in: true,
+        auth_mode: Some("chatgpt".into()),
+        account_id: Some(creds.account_id),
+        email: creds.email,
+    })
 }
 
 pub async fn start_device_login(
@@ -645,9 +654,7 @@ fn status_from_auth(auth: &Value) -> LoginStatus {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let (jwt_account, email) = id_token
-        .map(|token| extract_account_metadata(token, access.unwrap_or("")))
-        .unwrap_or((None, None));
+    let (jwt_account, email) = extract_account_metadata(id_token.unwrap_or(""), access.unwrap_or(""));
     let auth_mode = auth
         .get("auth_mode")
         .and_then(Value::as_str)
@@ -700,9 +707,9 @@ fn extract_account_metadata(
             .filter(|value| !value.is_empty())
             .map(str::to_string);
     }
-    if account_id.is_none() {
+    if account_id.is_none() || email.is_none() {
         if let Some(claims) = parse_jwt_claims(access_token) {
-            account_id = chatgpt_account_id(&claims);
+            account_id = account_id.or_else(|| chatgpt_account_id(&claims));
             if email.is_none() {
                 email = claims
                     .get("email")

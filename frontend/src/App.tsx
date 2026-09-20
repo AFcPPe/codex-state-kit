@@ -14,6 +14,7 @@ import { AppShell } from "@/components/AppShell";
 import { NetworkLogDialog } from "@/components/NetworkLogDialog";
 import { WarpPanel } from "@/components/WarpPanel";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
+import { isTauri } from "@/lib/api";
 import type { LoginMethod, Status, TurnStateView } from "@/types";
 
 function chipLabel(status: Status) {
@@ -291,6 +292,26 @@ export default function App() {
           {fwd.status.fetchError && turn?.status === "active" ? (
             <p className="token-card__meta token-card__meta--warn">刷新失败：{fwd.status.fetchError}</p>
           ) : null}
+        </section>
+
+        <section className="account-traffic" aria-label="当前账号请求统计">
+          <div className="account-traffic__heading">
+            <Activity size={19} aria-hidden="true" />
+            <div>
+              <h2>当前账号请求</h2>
+              <p>{isTauri ? (loggedIn ? "经本机转发的业务请求 · 不含 Token 探测" : "登录后显示账号请求统计") : "浏览器示例数据 · 非实际请求"}</p>
+            </div>
+          </div>
+          <dl className="account-traffic__metrics">
+            <div title="此账号已经发起、尚未结束的上游业务请求；包含等待响应和流式输出阶段。">
+              <dt>当前并发</dt>
+              <dd>{loggedIn ? fwd.status.accountTraffic?.concurrentRequests ?? "—" : "—"}<span>请求</span></dd>
+            </div>
+            <div title="滚动最近 60 秒内发起的业务请求次数，包括失败请求。">
+              <dt>RPM <span>最近 60 秒</span></dt>
+              <dd>{loggedIn ? fwd.status.accountTraffic?.rpm ?? "—" : "—"}<span>次 / 分钟</span></dd>
+            </div>
+          </dl>
         </section>
 
         {fwd.status.degraded ? (
