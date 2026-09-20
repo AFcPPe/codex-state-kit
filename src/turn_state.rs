@@ -4,7 +4,7 @@ use chrono::{SecondsFormat, Utc};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const HEADER_NAME: &str = "x-codex-turn-state";
 /// Token 有效期：40 分钟
@@ -61,6 +61,7 @@ pub struct PoolTokenInfo {
 #[serde(rename_all = "camelCase")]
 pub struct ModelTokenView {
     pub model: String,
+    pub fetch_disabled: bool,
     pub status: String,
     pub age_secs: Option<i64>,
     pub len: Option<usize>,
@@ -90,6 +91,8 @@ pub struct TurnStateView {
 
 #[derive(Serialize, Deserialize)]
 struct PersistedStore {
+    #[serde(default)]
+    disabled_models: HashSet<String>,
     #[serde(default)]
     version: u32,
     #[serde(default)]
@@ -123,6 +126,8 @@ const PERSIST_VERSION: u32 = 2;
 
 /// 按模型管理 token 池，支持被动发现 + 自动预取。
 pub struct TurnStateStore {
+    /// 用户禁用的模型，独立于账号、活跃窗口和 Token 缓存。
+    disabled_models: HashSet<String>,
     /// 当前绑定长度的活跃 token（直接用于注入）
     tokens: HashMap<String, TurnState>,
     /// 所有长度的 token 缓存：model → [各长度最新 TurnState]
@@ -144,6 +149,7 @@ pub struct TurnStateStore {
 impl Default for TurnStateStore {
     fn default() -> Self {
         Self {
+            disabled_models: HashSet::new(),
             tokens: HashMap::new(),
             pool: HashMap::new(),
             active_models: HashMap::new(),
@@ -167,7 +173,11 @@ fn token_path() -> std::path::PathBuf {
 
 impl TurnStateStore {
     pub fn load() -> Self {
-        let raw = match std::fs::read_to_string(token_path()) {
+        Self::load_from(&token_path())
+    }
+
+    fn load_from(path: &std::path::Path) -> Self {
+        let raw = match std::fs::read_to_string(path) {
             Ok(raw) => raw,
             Err(_) => return Self::default(),
         };
@@ -244,6 +254,7 @@ impl TurnStateStore {
                     model_bound_lens: mbl,
                     distributions: dist,
                     account_id: store.account_id,
+                    disabled_models: store.disabled_models,
                 };
             }
         }
@@ -279,6 +290,7 @@ impl TurnStateStore {
                     model_bound_lens: HashMap::new(),
                     distributions: HashMap::new(),
                     account_id: None,
+                    disabled_models: HashSet::new(),
                 };
             }
         }
@@ -301,6 +313,7 @@ impl TurnStateStore {
                     model_bound_lens: HashMap::new(),
                     distributions: HashMap::new(),
                     account_id: None,
+                    disabled_models: HashSet::new(),
                 };
             }
         }
@@ -309,10 +322,16 @@ impl TurnStateStore {
     }
 
     fn persist(&mut self) {
+        if let Err(err) = self.persist_to(&token_path()) {
+            eprintln!("[token] 保存失败: {err:#}");
+        }
+    }
+
+    fn persist_to(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         // 持久化前先清理过期/多余 token
         self.cleanup_pool();
-        let path = token_path();
         let store = PersistedStore {
+            disabled_models: self.disabled_models.clone(),
             version: PERSIST_VERSION,
             tokens: self.tokens.clone(),
             active_models: self.active_models.clone(),
@@ -323,9 +342,35 @@ impl TurnStateStore {
             distributions: self.distributions.clone(),
             account_id: self.account_id.clone(),
         };
-        if let Ok(raw) = serde_json::to_string_pretty(&store) {
-            let _ = std::fs::write(&path, raw);
+        let raw = serde_json::to_string_pretty(&store)?;
+        std::fs::write(path, raw)?;
+        Ok(())
+    }
+
+    pub fn is_fetch_disabled(&self, model: &str) -> bool {
+        self.disabled_models.contains(model)
+    }
+
+    pub fn set_model_fetch_disabled(&mut self, model: &str, disabled: bool) -> anyhow::Result<()> {
+        self.set_model_fetch_disabled_at(model, disabled, &token_path())
+    }
+
+    fn set_model_fetch_disabled_at(&mut self, model: &str, disabled: bool, path: &std::path::Path) -> anyhow::Result<()> {
+        anyhow::ensure!(!model.trim().is_empty(), "模型名称不能为空");
+        let previous = self.disabled_models.clone();
+        let previous_active = self.active_models.clone();
+        if disabled {
+            self.disabled_models.insert(model.to_owned());
+        } else {
+            self.disabled_models.remove(model);
+            self.active_models.insert(model.to_owned(), now_unix());
         }
+        if let Err(err) = self.persist_to(path) {
+            self.disabled_models = previous;
+            self.active_models = previous_active;
+            return Err(err.context("保存模型获取设置失败"));
+        }
+        Ok(())
     }
 
     // ─── 模型自动发现 ──────────────────────────────────────────
@@ -484,6 +529,9 @@ impl TurnStateStore {
     /// - 无 token → 需要
     /// - token 年龄 > 35 分钟（PREFETCH_AGE_SECS）→ 需要预取
     pub fn needs_refresh(&self, model: &str) -> bool {
+        if self.is_fetch_disabled(model) {
+            return false;
+        }
         match self.tokens.get(model) {
             None => true,
             Some(ts) => {
@@ -685,7 +733,10 @@ impl TurnStateStore {
 
     /// 生成状态视图，自动展示所有活跃模型。
     pub fn view(&self) -> TurnStateView {
-        let active = self.all_active_models();
+        let mut active = self.all_active_models();
+        active.extend(self.disabled_models.iter().cloned());
+        active.sort();
+        active.dedup();
         self.view_for_models(&active)
     }
 
@@ -724,7 +775,9 @@ impl TurnStateStore {
                 match self.tokens.get(model) {
                     Some(state) => {
                         let age = now - state.issued_unix;
-                        let status = if age > MAX_AGE_SECS {
+                        let status = if self.is_fetch_disabled(model) {
+                            "disabled"
+                        } else if age > MAX_AGE_SECS {
                             "expired"
                         } else if age > PREFETCH_AGE_SECS {
                             "refreshing"
@@ -732,6 +785,7 @@ impl TurnStateStore {
                             "active"
                         };
                         ModelTokenView {
+                            fetch_disabled: self.is_fetch_disabled(model),
                             model: model.clone(),
                             status: status.into(),
                             age_secs: Some(age),
@@ -744,8 +798,9 @@ impl TurnStateStore {
                         }
                     }
                     None => ModelTokenView {
+                        fetch_disabled: self.is_fetch_disabled(model),
                         model: model.clone(),
-                        status: "empty".into(),
+                        status: if self.is_fetch_disabled(model) { "disabled" } else { "empty" }.into(),
                         age_secs: None,
                         len: None,
                         captured_at: None,
@@ -757,9 +812,10 @@ impl TurnStateStore {
             })
             .collect();
 
-        let overall_status = if model_views.is_empty() {
+        let enabled: Vec<_> = model_views.iter().filter(|v| !v.fetch_disabled).collect();
+        let overall_status = if enabled.is_empty() {
             "idle"
-        } else if model_views.iter().all(|v| v.status == "active") {
+        } else if enabled.iter().all(|v| v.status == "active") {
             "active"
         } else if model_views
             .iter()
@@ -1072,6 +1128,58 @@ mod tests {
     }
 
     #[test]
+    fn disabled_models_persist_until_explicitly_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let mut store = TurnStateStore::default();
+        store.set_model_fetch_disabled_at("codex-auto-review", true, &path).unwrap();
+        let mut restored = TurnStateStore::load_from(&path);
+        assert!(restored.is_fetch_disabled("codex-auto-review"));
+        assert!(!restored.needs_refresh("codex-auto-review"));
+        assert!(restored.needs_refresh("another-model"));
+        // Disabled models remain visible even without recent requests or tokens.
+        let view = restored.view();
+        assert_eq!(view.status, "idle");
+        assert_eq!(view.models.len(), 1);
+        assert!(view.models[0].fetch_disabled);
+        assert_eq!(view.models[0].status, "disabled");
+        restored.register_model("codex-auto-review");
+        restored.invalidate_all();
+        restored.bind_account("another-account");
+        assert!(!restored.needs_refresh("codex-auto-review"));
+        restored.set_model_fetch_disabled_at("codex-auto-review", false, &path).unwrap();
+        let enabled = TurnStateStore::load_from(&path);
+        assert!(!enabled.is_fetch_disabled("codex-auto-review"));
+        assert!(enabled.needs_refresh("codex-auto-review"));
+        assert!(enabled.all_active_models().contains(&"codex-auto-review".into()));
+    }
+
+    #[test]
+    fn failed_disabled_model_save_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TurnStateStore::default();
+        assert!(store.set_model_fetch_disabled_at("review", true, dir.path()).is_err());
+        assert!(!store.is_fetch_disabled("review"));
+        store.disabled_models.insert("review".into());
+        assert!(store.set_model_fetch_disabled_at("review", false, dir.path()).is_err());
+        assert!(store.is_fetch_disabled("review"));
+        assert!(store.all_active_models().is_empty());
+    }
+
+    #[test]
+    fn legacy_store_defaults_to_enabled_and_disabled_models_do_not_reduce_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.json");
+        std::fs::write(&path, r#"{"version":2}"#).unwrap();
+        let mut store = TurnStateStore::load_from(&path);
+        assert!(!store.is_fetch_disabled("codex-auto-review"));
+        store.disabled_models.insert("codex-auto-review".into());
+        store.active_models.insert("enabled".into(), now_unix());
+        store.store_to_pool("enabled", &token_for(now_unix()), "test");
+        assert_eq!(store.view().status, "active");
+    }
+
+    #[test]
     fn parses_fernet_timestamp() {
         let issued = 1_700_000_000;
         let token = token_for(issued);
@@ -1371,6 +1479,7 @@ mod tests {
         store.capture("gpt-6-astra", &token, "fetch");
 
         let persisted = PersistedStore {
+            disabled_models: store.disabled_models.clone(),
             version: PERSIST_VERSION,
             tokens: store.tokens.clone(),
             active_models: store.active_models.clone(),

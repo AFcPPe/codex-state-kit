@@ -29,6 +29,7 @@ function chipClass(status: Status) {
 
 function tokenChip(view?: TurnStateView | null) {
   if (!view || view.status === "empty") return { label: "等待 Token", className: "runtime-chip runtime-chip--idle" };
+  if (view.status === "idle" && view.models?.length && view.models.every((m) => m.fetchDisabled)) return { label: "获取已禁用", className: "runtime-chip runtime-chip--idle" };
   if (view.status === "idle") return { label: "等待请求", className: "runtime-chip runtime-chip--idle" };
   if (view.status === "active") return { label: "Token 可用", className: "runtime-chip" };
   if (view.status === "partial") return { label: "部分可用", className: "runtime-chip runtime-chip--warm" };
@@ -51,9 +52,10 @@ function formatAge(secs?: number | null) {
 function modelSummary(view?: TurnStateView | null): string {
   const models = view?.models;
   if (!models || models.length === 0) return "";
-  const active = models.filter((m) => m.status === "active").length;
+  const enabled = models.filter((m) => !m.fetchDisabled);
+  const active = enabled.filter((m) => m.status === "active").length;
   const bound = view?.boundTokenLen ?? 292;
-  return `${active}/${models.length} 个模型 Token 就绪 · 绑定 ${bound}`;
+  return `${active}/${enabled.length} 个模型 Token 就绪 · 绑定 ${bound} · 已禁用 ${models.length - enabled.length}`;
 }
 
 const STATE_POLICY_OPTIONS: Array<{
@@ -96,6 +98,9 @@ const STATE_POLICY_OPTIONS: Array<{
 
 function tokenCopy(view?: TurnStateView | null, fetchError?: string | null) {
   const bound = view?.boundTokenLen ?? 292;
+  if (view?.models?.length && view.models.every((m) => m.fetchDisabled)) {
+    return { title: "模型 Token 获取已禁用", body: "禁用设置已保存，重启后仍生效。点击模型旁的“解除禁用”恢复获取。", loading: false };
+  }
   if (fetchError && (!view || (view.status !== "active" && view.status !== "idle"))) {
     return {
       title: `正在获取 ${bound} Token…`,
@@ -264,6 +269,7 @@ export default function App() {
           <span className="token-card__badge"><Radio size={14} /> {fwd.status.proxyOk ? `自动管理 · 绑定 ${turn?.boundTokenLen ?? 292}` : "等待代理启动"}</span>
           {turn?.models && turn.models.length > 0 ? (
             <div className="token-models">
+              <small>模型获取选择 · 禁用设置自动保存，重启后仍生效；已有缓存仍可复用。</small>
               {turn.models.map((m) => {
                 const effectiveBound = m.boundOverride ?? turn.boundTokenLen ?? 292;
                 const hasOverride = m.boundOverride != null;
@@ -273,6 +279,16 @@ export default function App() {
                     <i />{m.model}{m.ageSecs != null ? ` · ${formatAge(m.ageSecs)}` : ""}{m.len ? ` · ${m.len}字节` : ""}
                     {hasOverride ? <span className="token-model__override">独立绑定 {effectiveBound}</span> : null}
                   </span>
+                  <button
+                    type="button"
+                    className="token-pool__chip"
+                    disabled={fwd.modelFetchPending || !isTauri}
+                    aria-label={`${m.fetchDisabled ? "解除禁用" : "禁用获取"} ${m.model}`}
+                    onClick={() => void fwd.toggleModelFetch(m.model, !m.fetchDisabled)}
+                  >
+                    {m.fetchDisabled ? "解除禁用" : "禁用获取"}
+                  </button>
+                  {m.fetchDisabled ? <span className="token-model__disabled">已禁用获取</span> : null}
                   {/* 池中缓存的 token（所有长度），点击设置模型级绑定 */}
                   {m.poolTokens && m.poolTokens.length > 0 ? (
                     <span className="token-pool">

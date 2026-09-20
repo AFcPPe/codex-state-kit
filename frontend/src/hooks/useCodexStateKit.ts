@@ -8,6 +8,7 @@ import {
   setConfig,
   setBoundTokenLen,
   setModelBoundTokenLen,
+  setModelFetchDisabled,
   openUrl,
   startChatgptLogin,
   openWarpTerms as openWarpTermsApi,
@@ -253,6 +254,19 @@ export function useCodexStateKit() {
     }
   }, []);
 
+  const [modelFetchPending, setModelFetchPending] = useState(false);
+  const toggleModelFetch = useCallback(async (model: string, disabled: boolean) => {
+    setModelFetchPending(true);
+    try {
+      setStatus(await setModelFetchDisabled(model, disabled));
+      setBanner({ kind: "ok", text: `${model} ${disabled ? "已禁用 Token 获取（已保存）" : "已解除禁用"}` });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setModelFetchPending(false);
+    }
+  }, []);
+
   const bindModelTokenLen = useCallback(async (model: string, len: number | null) => {
     try {
       const next = await setModelBoundTokenLen(model, len);
@@ -281,6 +295,8 @@ export function useCodexStateKit() {
     loadLogin,
     bindTokenLen,
     bindModelTokenLen,
+    toggleModelFetch,
+    modelFetchPending,
     dismissBanner: () => setBanner(null),
   };
 }

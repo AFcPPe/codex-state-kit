@@ -44,6 +44,7 @@ pub fn run() {
             commands::open_url,
             commands::set_bound_token_len,
             commands::set_model_bound_token_len,
+            commands::set_model_fetch_disabled,
             commands::connect_warp,
             commands::stop_warp,
             commands::open_warp_terms,

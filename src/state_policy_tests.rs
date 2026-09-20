@@ -175,6 +175,30 @@ async fn policies_preserve_strip_wait_and_cancel_without_cross_account_replay() 
         assert_eq!(app.logs.lock().await.back().unwrap().error_kind.as_deref(), Some("state_model_unknown"));
         assert!(received.try_recv().is_err());
 
+        // Disabling a model ends an existing waiter and blocks direct/manual
+        // probes, while the user's ordinary preserve policy still forwards.
+        app.turn_state.lock().await.invalidate_all();
+        let pending = tokio::spawn(proxy_http(app.clone(), request(true, true)));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!pending.is_finished());
+        app.set_model_fetch_disabled("policy-model", true).await.unwrap();
+        assert_eq!(pending.await.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(app.logs.lock().await.back().unwrap().error_kind.as_deref(), Some("state_fetch_disabled"));
+        assert!(received.try_recv().is_err());
+        assert_eq!(app.fetch_once("policy-model").await.unwrap_err().retry, FetchRetryClass::Stale);
+        app.settings.lock().await.models = vec!["policy-model".into()];
+        app.refresh_turn_state().await.unwrap();
+        assert!(TurnStateStore::load().is_fetch_disabled("policy-model"));
+        app.settings.lock().await.state_miss_policy = Preserve;
+        let response = proxy_http(app.clone(), request(true, true)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(received.recv().await.unwrap()[turn_state::HEADER_NAME], "client-state");
+        app.set_model_fetch_disabled("policy-model", false).await.unwrap();
+        assert!(!TurnStateStore::load().is_fetch_disabled("policy-model"));
+        assert!(app.turn_state.lock().await.needs_refresh("policy-model"));
+        app.settings.lock().await.state_miss_policy = Wait;
+
         // A waiting request ignores expired and other-model tickets, then uses
         // the matching ticket when it arrives. No probe is spawned by the waiter.
         app.turn_state.lock().await.invalidate_all();

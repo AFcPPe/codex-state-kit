@@ -237,6 +237,11 @@ export async function setBoundTokenLen(len: number | null): Promise<Status> {
   return cloneStatus();
 }
 
+export async function setModelFetchDisabled(model: string, disabled: boolean): Promise<Status> {
+  if (isTauri) return invoke<Status>("set_model_fetch_disabled", { model, disabled });
+  throw new Error("模型获取设置仅在桌面应用中可用");
+}
+
 export async function setModelBoundTokenLen(model: string, len: number | null): Promise<Status> {
   if (isTauri) {
     return invoke<Status>("set_model_bound_token_len", { model, len });

@@ -292,3 +292,7 @@ svg { flex-shrink: 0; }
 .token-card--idle .token-card__icon { color: var(--muted); }
 .token-card--partial .token-card__icon { color: var(--warm); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } .spinner { animation-duration: 1.5s; } }
+
+.token-model--disabled i { background: var(--muted); }
+.token-model__disabled { color: var(--muted); font-size: 10px; }
+.token-pool__chip:disabled { opacity: .5; cursor: not-allowed; }

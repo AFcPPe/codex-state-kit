@@ -222,6 +222,15 @@ pub async fn set_bound_token_len(
 }
 
 #[tauri::command(async)]
+pub async fn set_model_fetch_disabled(
+    state: State<'_, AppState>,
+    model: String,
+    disabled: bool,
+) -> CommandResult<Status> {
+    state.proxy.core().set_model_fetch_disabled(&model, disabled).await.map_err(|err| format!("{err:#}"))
+}
+
+#[tauri::command(async)]
 pub async fn set_model_bound_token_len(
     state: State<'_, AppState>,
     model: String,

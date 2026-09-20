@@ -54,6 +54,7 @@ export interface PoolTokenInfo {
 }
 
 export interface ModelTokenView {
+  fetchDisabled?: boolean;
   model: string;
   status: "active" | "refreshing" | "expired" | "empty" | string;
   ageSecs?: number | null;

@@ -390,8 +390,12 @@ impl App {
             self.turn_state.lock().await.register_model(&model);
             models.push(model);
         }
+        models.retain(|model| !model.is_empty());
         let mut first_error = None;
         for model in &models {
+            if self.turn_state.lock().await.is_fetch_disabled(model) {
+                continue;
+            }
             if let Err(e) = self.fetch_once(model).await {
                 eprintln!("[refresh] 模型 {} 获取失败: {e}", model);
                 let can_try_other_model =
@@ -445,6 +449,23 @@ impl App {
         drop(_transition);
         self.degrade_notify.notify_one();
         self.status().await
+    }
+
+    pub async fn set_model_fetch_disabled(&self, model: &str, disabled: bool) -> Result<Status> {
+        let transition = self.fetch_transition.lock().await;
+        let generation = IdentityGenerationChange::new(self);
+        let gate = self.fetch_gate.lock().await;
+        let result = self.turn_state.lock().await.set_model_fetch_disabled(model, disabled);
+        if result.is_ok() {
+            self.clear_model_fetch_delay(model).await;
+            *self.fetch_error.lock().await = None;
+        }
+        drop(generation);
+        drop(gate);
+        drop(transition);
+        self.model_notify.notify_one();
+        result?;
+        Ok(self.status().await)
     }
 
     fn fetch_settings(&self, settings: &Settings) -> Result<Settings> {
@@ -561,6 +582,9 @@ impl App {
                 FetchRetryClass::Normal,
             ));
         }
+        if self.turn_state.lock().await.is_fetch_disabled(model) {
+            return Err(FetchOnceError::new(format!("[{model}] 已禁用 Token 获取"), FetchRetryClass::Stale));
+        }
         let model_wait = self.model_fetch_wait(model).await;
         if !model_wait.is_zero() {
             return Err(FetchOnceError::new(
@@ -634,7 +658,14 @@ impl App {
             };
             let started = Instant::now();
             let mut details = NetworkLogDetails::default();
-            let result = fetch::fetch_turn_state_with_log(
+            let changed = self.fetch_change_notify.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.fetch_generation.load(Ordering::SeqCst) != generation {
+                return Err(FetchOnceError::new("Token 获取设置已变化", FetchRetryClass::Stale));
+            }
+            let result = tokio::select! {
+                result = fetch::fetch_turn_state_with_log(
                 &client,
                 &settings,
                 &creds,
@@ -642,8 +673,11 @@ impl App {
                 target_len,
                 allow_auto_quality,
                 &mut details,
-            )
-            .await;
+                ) => result,
+                _ = &mut changed => {
+                    return Err(FetchOnceError::new("Token 获取设置已变化，已取消在途获取", FetchRetryClass::Stale));
+                }
+            };
 
             if !fetch_account_is_current(&settings, &creds.account_id) {
                 details.turn_state_action = "discarded_stale_account".into();
@@ -1559,6 +1593,9 @@ async fn wait_for_request_state(
                 }
                 if let Some(token) = store.peek_for_model(model) {
                     return Ok(token);
+                }
+                if store.is_fetch_disabled(model) {
+                    return Err(state_wait_error(details, StatusCode::CONFLICT, "state_fetch_disabled", "该模型已禁用 Token 获取，无法等待新票据；请解除禁用或更改无票策略"));
                 }
             }
         }
