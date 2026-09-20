@@ -14,6 +14,7 @@ const MAX_TOKEN_FETCH_LOGS: usize = 30;
 
 #[derive(Clone, Debug, Default)]
 pub struct NetworkLogDetails {
+    pub state_policy: Option<crate::settings::StateMissPolicy>,
     pub account_id: Option<String>,
     pub account_email: Option<String>,
     pub flow: String,
@@ -25,6 +26,7 @@ pub struct NetworkLogDetails {
     pub peer_addr: Option<String>,
     pub http_version: Option<String>,
     pub model: Option<String>,
+    pub upstream_response_model: Option<String>,
     pub content_encoding: String,
     pub body_bytes: usize,
     pub turn_state_action: String,
@@ -43,6 +45,7 @@ pub struct NetworkLogDetails {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogEntry {
+    pub state_policy: Option<crate::settings::StateMissPolicy>,
     pub account_id: Option<String>,
     pub account_email: Option<String>,
     pub id: u64,
@@ -66,6 +69,7 @@ pub struct LogEntry {
     pub peer_addr: Option<String>,
     pub http_version: Option<String>,
     pub model: Option<String>,
+    pub upstream_response_model: Option<String>,
     pub content_encoding: String,
     pub body_bytes: usize,
     pub turn_state_action: String,
@@ -86,6 +90,7 @@ impl LogEntry {
             .response_header_ms
             .unwrap_or_else(|| started.elapsed().as_millis());
         Self {
+            state_policy: details.state_policy,
             id: LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             account_id: details.account_id,
             account_email: details.account_email,
@@ -109,6 +114,7 @@ impl LogEntry {
             peer_addr: details.peer_addr,
             http_version: details.http_version,
             model: details.model,
+            upstream_response_model: details.upstream_response_model,
             content_encoding: details.content_encoding,
             body_bytes: details.body_bytes,
             turn_state_action: details.turn_state_action,
@@ -219,6 +225,7 @@ pub fn request_error_kind(error: &reqwest::Error) -> String {
 pub struct ResponseMetrics {
     first_token_ms: Option<u128>,
     output_tokens: Option<u64>,
+    upstream_response_model: Option<String>,
     line: Vec<u8>,
     data: Vec<u8>,
     skip_event: bool,
@@ -403,6 +410,10 @@ impl ResponseMetrics {
         self.output_tokens
     }
 
+    pub fn upstream_response_model(&self) -> Option<&str> {
+        self.upstream_response_model.as_deref()
+    }
+
     pub fn completed(&self) -> bool {
         self.completed
     }
@@ -411,6 +422,25 @@ impl ResponseMetrics {
         let Ok(json) = serde_json::from_slice::<serde_json::Value>(event) else {
             return;
         };
+        let terminal = matches!(
+            json.get("type").and_then(serde_json::Value::as_str),
+            Some("response.completed" | "response.done" | "response.failed"
+                | "response.incomplete" | "response.cancelled" | "response.canceled")
+        );
+        // Read only provider metadata, never model-shaped fields in generated
+        // text, output items or tool arguments. Keep the first declaration;
+        // a terminal event overrides it, as in sub2api's model observer.
+        if self.upstream_response_model.is_none() || terminal {
+            if let Some(model) = [json.pointer("/response/model"), json.get("model")]
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(|model| safe_text(model, 80))
+                .find(|model| !model.is_empty())
+            {
+                self.upstream_response_model = Some(model);
+            }
+        }
         if self.is_sse && json.get("type").and_then(serde_json::Value::as_str) == Some("response.completed") {
             self.completed = true;
         }
@@ -531,12 +561,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn response_model_prefers_terminal_metadata_and_ignores_output_content() {
+        let mut metrics = ResponseMetrics::default();
+        for event in [
+            r#"{"type":"response.output_text.delta","delta":"{\"model\":\"fake\"}"}"#,
+            r#"{"type":"response.output_item.done","item":{"model":"fake"}}"#,
+            r#"{"output":[{"model":"fake"}],"data":[{"model":"fake"}]}"#,
+            r#"{"response":{"model":123},"model":null}"#,
+            r#"{"response":{"model":"broken"}"#,
+        ] {
+            metrics.observe(format!("data: {event}\n\n").as_bytes(), 10, true);
+            assert_eq!(metrics.upstream_response_model(), None);
+        }
+        for (event, expected) in [
+            (r#"{"type":"response.created","response":{"model":"gpt-5.6-sol"}}"#, "gpt-5.6-sol"),
+            (r#"{"type":"response.in_progress","response":{"model":"ignored"}}"#, "gpt-5.6-sol"),
+            (r#"{"type":"response.completed","response":{"model":"gpt-6-sol"},"model":"ignored"}"#, "gpt-6-sol"),
+            (r#"{"type":"response.created","response":{"model":"ignored"}}"#, "gpt-6-sol"),
+            (r#"{"type":"response.completed","response":{"model":" "}}"#, "gpt-6-sol"),
+        ] {
+            for byte in format!("data: {event}\r\n\r\n").bytes() {
+                metrics.observe(&[byte], 20, true);
+            }
+            assert_eq!(metrics.upstream_response_model(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn response_model_reads_json_and_chat_chunks_with_bounded_safe_names() {
+        for (body, expected) in [
+            (r#"{"object":"response","model":" gpt-6-sol\n "}"#.to_owned(), "gpt-6-sol".to_owned()),
+            (r#"{"response":{"model":""},"model":"gpt-6-astra"}"#.to_owned(), "gpt-6-astra".to_owned()),
+            (serde_json::json!({"model": "模".repeat(200)}).to_string(), "模".repeat(80)),
+        ] {
+            let mut metrics = ResponseMetrics::default();
+            metrics.observe(body.as_bytes(), 10, false);
+            metrics.finish(20);
+            assert_eq!(metrics.upstream_response_model(), Some(expected.as_str()));
+        }
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(b"data: {\"object\":\"chat.completion.chunk\",\"model\":\"gpt-6-sol\"}\n\n", 10, true);
+        assert_eq!(metrics.upstream_response_model(), Some("gpt-6-sol"));
+        let mut metrics = ResponseMetrics::default();
+        metrics.observe(b"{\"data\":[{\"id\":\"model-list-entry\"}]}", 10, false);
+        metrics.finish(20);
+        assert_eq!(metrics.upstream_response_model(), None);
+    }
+
+    #[test]
     fn compressed_metrics_parse_fragmented_streams() {
         use std::io::Write;
         let events = [
-            b"data: {\"type\":\"response.created\"}\n\n".as_slice(),
+            b"data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5.6-sol\"}}\n\n".as_slice(),
             b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n".as_slice(),
-            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":120}}}\n\n".as_slice(),
+            b"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-6-sol\",\"usage\":{\"output_tokens\":120}}}\n\n".as_slice(),
         ];
         for encoding in ["zstd", "gzip", "deflate"] {
             let mut chunks = Vec::new();
@@ -563,6 +641,7 @@ mod tests {
                     metrics.observe(&[*byte], (index as u128 + 1) * 50, true);
                 }
                 assert_eq!(metrics.first_token_ms(), (index > 0).then_some(100), "{encoding}");
+                assert_eq!(metrics.upstream_response_model(), Some(if index == 2 { "gpt-6-sol" } else { "gpt-5.6-sol" }), "{encoding}");
             }
             metrics.finish(200);
             assert_eq!(metrics.output_tokens(), Some(120), "{encoding}");
@@ -579,6 +658,7 @@ mod tests {
             assert!(metrics.disabled, "{encoding}");
             assert_eq!(metrics.first_token_ms(), None);
             assert_eq!(metrics.output_tokens(), None);
+            assert_eq!(metrics.upstream_response_model(), None);
             assert_eq!(metrics.error_kind, None);
         }
     }

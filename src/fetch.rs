@@ -578,7 +578,9 @@ mod tests {
             (
                 token_for_len_at(
                     turn_state::QUALITY_TOKEN_LEN,
-                    now + MAX_FUTURE_SKEW_SECS + 1,
+                    // Allow for wall-clock advancement during preceding HTTP
+                    // cases; a one-second margin can become valid mid-test.
+                    now + MAX_FUTURE_SKEW_SECS + 60,
                 ),
                 "rejected_future",
             ),

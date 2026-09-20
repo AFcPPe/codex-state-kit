@@ -11,6 +11,18 @@ pub enum OutboundMode {
     Warp,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StateMissPolicy {
+    #[default]
+    Preserve,
+    Wait,
+    Strip,
+    Passthrough,
+    #[serde(rename = "strip_all")]
+    StripAll,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -23,6 +35,7 @@ pub struct Settings {
     pub outbound_mode: OutboundMode,
     pub warp_http2: bool,
     pub models: Vec<String>,
+    pub state_miss_policy: StateMissPolicy,
 }
 
 impl Default for Settings {
@@ -36,6 +49,7 @@ impl Default for Settings {
             outbound_mode: OutboundMode::Warp,
             warp_http2: false,
             models: vec![],
+            state_miss_policy: StateMissPolicy::Preserve,
         }
     }
 }
@@ -70,6 +84,8 @@ pub struct SettingsPatch {
     pub warp_http2: bool,
     #[serde(default)]
     pub models: Vec<String>,
+    #[serde(default)]
+    pub state_miss_policy: StateMissPolicy,
 }
 
 impl SettingsPatch {
@@ -84,6 +100,7 @@ impl SettingsPatch {
             outbound_mode: self.outbound_mode,
             warp_http2: self.warp_http2,
             models,
+            state_miss_policy: self.state_miss_policy,
         };
         if settings.proxy_listen.is_empty()
             || settings.upstream.is_empty()
@@ -161,6 +178,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn state_policy_defaults_and_round_trips_without_losing_other_settings() {
+        assert_eq!(settings_from_json("{}").unwrap().state_miss_policy, StateMissPolicy::Preserve);
+        for (name, policy) in [
+            ("preserve", StateMissPolicy::Preserve), ("wait", StateMissPolicy::Wait),
+            ("strip", StateMissPolicy::Strip), ("passthrough", StateMissPolicy::Passthrough),
+            ("strip_all", StateMissPolicy::StripAll),
+        ] {
+            let patch: SettingsPatch = serde_json::from_value(serde_json::json!({
+                "proxyListen":"127.0.0.1:8787", "upstream":"https://example.com", "codexHome":"test",
+                "stateMissPolicy":name, "models":["test-model"], "upstreamProxy":"http://127.0.0.1:7890"
+            })).unwrap();
+            let settings = patch.into_settings().unwrap();
+            let loaded = settings_from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(loaded.state_miss_policy, policy);
+            assert_eq!(loaded.models, ["test-model"]);
+            assert_eq!(loaded.upstream_proxy, "http://127.0.0.1:7890");
+        }
+        assert!(serde_json::from_value::<StateMissPolicy>(serde_json::json!("unknown")).is_err());
+    }
+
+    #[test]
     fn upstream_proxy_defaults_and_round_trips() {
         assert!(settings_from_json("{}").unwrap().upstream_proxy.is_empty());
         for proxy in [
@@ -219,6 +257,7 @@ mod tests {
     #[test]
     fn patch_keeps_optional_proxy() {
         let settings = SettingsPatch {
+            state_miss_policy: StateMissPolicy::Preserve,
             proxy_listen: "127.0.0.1:8787".into(),
             upstream: "https://chatgpt.com/backend-api/codex".into(),
             codex_home: "/tmp/codex".into(),

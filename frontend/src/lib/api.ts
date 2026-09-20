@@ -26,6 +26,8 @@ const emptyTurnState = () => ({
 });
 
 const defaultStatus = (): Status => ({
+  stateMissPolicy: "preserve",
+  configuredModels: [],
   currentAccountId: "mock-account-b",
   currentAccountEmail: "mock@example.com",
   accountTraffic: { concurrentRequests: 2, rpm: 18 },
@@ -79,8 +81,12 @@ const defaultStatus = (): Status => ({
     turnStateLen: null,
     returnedTurnStateLen: 292,
     errorKind: null,
-  }, {
-    id: 2,
+  }, ...[
+    { model: "gpt-6-astra", upstreamResponseModel: null },
+    { model: "gpt-6-astra", upstreamResponseModel: "gpt-6-astra" },
+    { model: "gpt-5.6-sol", upstreamResponseModel: "gpt-6-sol" },
+  ].map((models, index) => ({
+    id: index + 2,
     accountId: "mock-account-b",
     accountEmail: "mock@example.com",
     ts: new Date().toISOString(),
@@ -101,14 +107,14 @@ const defaultStatus = (): Status => ({
     proxyEndpoint: "socks5h://proxy.example.test:44445",
     peerAddr: "198.51.100.10:44445",
     httpVersion: "HTTP/2",
-    model: "gpt-6-astra",
+    ...models,
     contentEncoding: "zstd",
     bodyBytes: 18432,
     turnStateAction: "replaced",
     turnStateLen: 292,
     returnedTurnStateLen: 292,
     errorKind: null,
-  }],
+  }))],
 });
 
 const defaultLogin = (): LoginStatus => ({
@@ -163,6 +169,8 @@ export async function setConfig(settings: SettingsPatch): Promise<Status> {
     upstreamProxy: settings.upstreamProxy,
     outboundMode: settings.outboundMode,
     warpHttp2: settings.warpHttp2,
+    stateMissPolicy: settings.stateMissPolicy,
+    configuredModels: settings.models,
     proxyOk: true,
   };
   mockConfig.codexHome = settings.codexHome;

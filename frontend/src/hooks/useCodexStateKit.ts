@@ -12,7 +12,7 @@ import {
   startChatgptLogin,
   openWarpTerms as openWarpTermsApi,
 } from "@/lib/api";
-import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode } from "@/types";
+import type { Banner, LoginMethod, LoginStart, LoginStatus, Status, OutboundMode, StateMissPolicy } from "@/types";
 
 function errorMessage(cause: unknown): string {
   if (typeof cause === "string") return cause;
@@ -101,6 +101,8 @@ export function useCodexStateKit() {
       upstreamProxy,
       outboundMode,
       warpHttp2,
+      stateMissPolicy: current.stateMissPolicy,
+      models: current.configuredModels,
     });
   }, []);
 
@@ -129,6 +131,25 @@ export function useCodexStateKit() {
   const openWarpTerms = useCallback(async () => {
     try { await openWarpTermsApi(); }
     catch (cause) { setBanner({ kind: "error", text: errorMessage(cause) }); }
+  }, []);
+
+  const setStateMissPolicy = useCallback(async (stateMissPolicy: StateMissPolicy) => {
+    setBusy("save");
+    try {
+      const latest = await getStatus();
+      const next = await setConfig({
+        proxyListen: latest.proxyListen, upstream: latest.upstream, codexHome: latest.codexHome,
+        outboundProxy: latest.outboundProxy, upstreamProxy: latest.upstreamProxy,
+        outboundMode: latest.outboundMode, warpHttp2: latest.warpHttp2, stateMissPolicy,
+        models: latest.configuredModels,
+      });
+      setStatus(next);
+      setBanner({ kind: "ok", text: "State 处理策略已保存。" });
+    } catch (cause) {
+      setBanner({ kind: "error", text: errorMessage(cause) });
+    } finally {
+      setBusy(null);
+    }
   }, []);
 
   const refreshToken = useCallback(async (home: string, outboundProxy: string) => {
@@ -251,6 +272,7 @@ export function useCodexStateKit() {
     busy,
     refresh,
     saveSettings,
+    setStateMissPolicy,
     refreshToken,
     openWarpTerms,
     startLogin,

@@ -15,7 +15,7 @@ import { NetworkLogDialog } from "@/components/NetworkLogDialog";
 import { WarpPanel } from "@/components/WarpPanel";
 import { useCodexStateKit } from "@/hooks/useCodexStateKit";
 import { isTauri } from "@/lib/api";
-import type { LoginMethod, Status, TurnStateView } from "@/types";
+import type { LoginMethod, Status, TurnStateView, StateMissPolicy } from "@/types";
 
 function chipLabel(status: Status) {
   if (status.attached) return "已接入";
@@ -55,6 +55,44 @@ function modelSummary(view?: TurnStateView | null): string {
   const bound = view?.boundTokenLen ?? 292;
   return `${active}/${models.length} 个模型 Token 就绪 · 绑定 ${bound}`;
 }
+
+const STATE_POLICY_OPTIONS: Array<{
+  value: StateMissPolicy;
+  label: string;
+  summary: string;
+  tooltip: string;
+}> = [
+  {
+    value: "preserve",
+    label: "无票保留",
+    summary: "无票时沿用原值",
+    tooltip: "优先替换为当前账号、当前模型的有效凭证；没有匹配凭证时保留客户端原 State。默认策略，兼容性优先。",
+  },
+  {
+    value: "wait",
+    label: "无票等待",
+    summary: "等有效票再发送",
+    tooltip: "没有匹配凭证时持续等待，直到取得当前账号、模型和绑定长度的有效 State。保证凭证匹配，不代表保证模型智力或回答质量。客户端取消，或账号、线路、策略变化时终止。",
+  },
+  {
+    value: "strip",
+    label: "无票剥离",
+    summary: "无票时删除",
+    tooltip: "优先替换为有效凭证；没有匹配凭证时删除客户端 State，让上游自行处理。用于观察无 State 请求的效果。",
+  },
+  {
+    value: "passthrough",
+    label: "不替换",
+    summary: "始终沿用原值",
+    tooltip: "始终原样转发客户端 State，即使本地有有效凭证也不替换。用于和自动替换策略做对照。",
+  },
+  {
+    value: "strip_all",
+    label: "全部剥离",
+    summary: "始终删除 State",
+    tooltip: "所有业务请求发出前都删除 State，包括本地已有有效凭证的情况。这是实验性策略，效果待验证。",
+  },
+];
 
 function tokenCopy(view?: TurnStateView | null, fetchError?: string | null) {
   const bound = view?.boundTokenLen ?? 292;
@@ -443,6 +481,36 @@ export default function App() {
               onBlur={() => void fwd.saveSettings(codexHome, outboundProxy)}
               onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} />
           </label>
+          <div className="connection-policy">
+            <div className="field connection-directory state-policy-field">
+              <span>State 处理策略</span>
+              <div className="state-policy-options" role="radiogroup" aria-label="State 处理策略">
+                {STATE_POLICY_OPTIONS.map((option) => (
+                  <label
+                    key={option.value}
+                    className={`state-policy-option${(fwd.status?.stateMissPolicy ?? "preserve") === option.value ? " state-policy-option--selected" : ""}`}
+                    data-tooltip={option.tooltip}
+                  >
+                    <input
+                      type="radio"
+                      name="state-miss-policy"
+                      value={option.value}
+                      checked={(fwd.status?.stateMissPolicy ?? "preserve") === option.value}
+                      aria-label={option.label}
+                      aria-description={option.tooltip}
+                      disabled={fwd.busy !== null}
+                      onChange={() => void fwd.setStateMissPolicy(option.value)}
+                    />
+                    <span className="state-policy-option__radio" aria-hidden="true" />
+                    <span className="state-policy-option__copy">
+                      <strong>{option.label}</strong>
+                      <small>{option.summary}</small>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
 
         <footer className="page-footer">

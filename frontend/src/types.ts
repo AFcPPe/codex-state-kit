@@ -1,4 +1,5 @@
 export interface LogEntry {
+  statePolicy?: StateMissPolicy | null;
   accountId?: string | null;
   accountEmail?: string | null;
   id: number;
@@ -22,6 +23,7 @@ export interface LogEntry {
   peerAddr?: string | null;
   httpVersion?: string | null;
   model?: string | null;
+  upstreamResponseModel?: string | null;
   contentEncoding: string;
   bodyBytes: number;
   turnStateAction: string;
@@ -65,6 +67,8 @@ export interface TurnStateView {
 }
 
 export interface Status {
+  stateMissPolicy: StateMissPolicy;
+  configuredModels: string[];
   currentAccountId?: string | null;
   currentAccountEmail?: string | null;
   accountTraffic: { concurrentRequests: number; rpm: number };
@@ -89,6 +93,8 @@ export interface Status {
 }
 
 export interface SettingsPatch {
+  models: string[];
+  stateMissPolicy: StateMissPolicy;
   proxyListen: string;
   upstream: string;
   codexHome: string;
@@ -99,6 +105,7 @@ export interface SettingsPatch {
 }
 
 export type OutboundMode = "manual" | "warp";
+export type StateMissPolicy = "preserve" | "wait" | "strip" | "passthrough" | "strip_all";
 
 export interface WarpStatus {
   available: boolean;

@@ -21,7 +21,7 @@ use crate::fetch;
 use crate::login::{self, has_chatgpt_login};
 use crate::logs::{self, LogEntry, NetworkLogDetails};
 use crate::traffic::{AccountTraffic, RequestActivity, TrafficTracker};
-use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch};
+use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch, StateMissPolicy};
 use crate::turn_state::{self, TurnStateStore, TurnStateView};
 use crate::warp::{WarpRuntime, WarpStatus};
 
@@ -145,6 +145,8 @@ pub struct Status {
     pub account_traffic: AccountTraffic,
     pub current_account_id: Option<String>,
     pub current_account_email: Option<String>,
+    pub state_miss_policy: StateMissPolicy,
+    pub configured_models: Vec<String>,
 }
 
 pub struct App {
@@ -270,6 +272,8 @@ impl App {
             account_traffic,
             current_account_id: account,
             current_account_email: login_status.email,
+            state_miss_policy: settings.state_miss_policy,
+            configured_models: settings.models,
         }
     }
 
@@ -1142,6 +1146,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
                     if tracker.finished
                         || tracker.entry.first_token_ms != tracker.metrics.first_token_ms()
                         || tracker.entry.output_tokens != tracker.metrics.output_tokens()
+                        || tracker.entry.upstream_response_model.as_deref() != tracker.metrics.upstream_response_model()
                         || tracker.entry.error_kind.as_deref() != tracker.metrics.error_kind
                     {
                         tracker.refresh();
@@ -1153,9 +1158,12 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
             Response::from_parts(parts, Body::from_stream(stream))
         }
         Err(err) => {
-            app.record(method.as_str(), &path, 502, started, details)
+            let status = details.response_status
+                .and_then(|status| StatusCode::from_u16(status).ok())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            app.record(method.as_str(), &path, status.as_u16(), started, details)
                 .await;
-            (StatusCode::BAD_GATEWAY, err.to_string()).into_response()
+            (status, err.to_string()).into_response()
         }
     }
 }
@@ -1180,6 +1188,7 @@ impl ResponseLogTracker {
         self.entry.ms = self.started.elapsed().as_millis();
         self.entry.first_token_ms = self.metrics.first_token_ms();
         self.entry.output_tokens = self.metrics.output_tokens();
+        self.entry.upstream_response_model = self.metrics.upstream_response_model().map(str::to_owned);
         self.entry.in_progress = !self.finished;
         if self.entry.error_kind.is_none() {
             self.entry.error_kind = self.metrics.error_kind.map(str::to_owned);
@@ -1265,23 +1274,84 @@ async fn forward_http_with_log(
     forward_http_tracked(app, req, details, &mut None).await
 }
 
+fn state_wait_error(details: &mut NetworkLogDetails, status: StatusCode, kind: &str, message: &str) -> anyhow::Error {
+    details.response_status = Some(status.as_u16());
+    details.error_kind = Some(kind.into());
+    details.turn_state_action = kind.into();
+    anyhow::anyhow!("{message}")
+}
+
+/// Wait inside the request future: cancellation drops this waiter, and only the
+/// existing fetch loop performs probes (including its shared rate limits).
+async fn wait_for_request_state(
+    app: &App,
+    request_settings: &Settings,
+    account: Option<&str>,
+    model: Option<&str>,
+    details: &mut NetworkLogDetails,
+) -> Result<String> {
+    let Some(model) = model else {
+        return Err(state_wait_error(details, StatusCode::UNPROCESSABLE_ENTITY, "state_model_unknown", "无法识别请求模型，不能等待匹配的 state；请求未转发"));
+    };
+    let Some(account) = account else {
+        return Err(state_wait_error(details, StatusCode::CONFLICT, "state_account_unknown", "无法识别请求账号，不能等待匹配的 state；请求未转发"));
+    };
+    app.model_notify.notify_one();
+    loop {
+        let current = app.settings.lock().await.clone();
+        if current.state_miss_policy != StateMissPolicy::Wait {
+            return Err(state_wait_error(details, StatusCode::CONFLICT, "state_wait_policy_changed", "等待策略已切换，请重新发起请求；请求未转发"));
+        }
+        if current.codex_home != request_settings.codex_home || current.upstream != request_settings.upstream
+            || current.upstream_proxy != request_settings.upstream_proxy || current.outbound_proxy != request_settings.outbound_proxy
+            || current.outbound_mode != request_settings.outbound_mode || current.warp_http2 != request_settings.warp_http2 {
+            return Err(state_wait_error(details, StatusCode::CONFLICT, "state_wait_config_changed", "等待期间线路配置已变化，请重新发起请求；请求未转发"));
+        }
+        if !login::chatgpt_credentials(Path::new(&request_settings.codex_home)).is_ok_and(|creds| creds.account_id == account) {
+            return Err(state_wait_error(details, StatusCode::CONFLICT, "state_wait_account_changed", "等待期间登录账号已变化或退出，请重新发起请求；请求未转发"));
+        }
+        {
+            let mut store = app.turn_state.lock().await;
+            if store.is_bound_to_account(account) {
+                // Keep the model active while its callers wait, including after
+                // the background loop has initialized a newly logged-in account.
+                if store.register_model(model) {
+                    app.model_notify.notify_one();
+                }
+                if let Some(token) = store.peek_for_model(model) {
+                    return Ok(token);
+                }
+            }
+        }
+        // Poll also observes login files changed outside Kit. No locks are held
+        // while sleeping and no task is spawned that could outlive the client.
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+            _ = app.fetch_change_notify.notified() => {},
+        }
+    }
+}
+
 async fn forward_http_tracked(
     app: &App,
     req: Request<Body>,
     details: &mut NetworkLogDetails,
     activity: &mut Option<RequestActivity>,
 ) -> Result<Response> {
-    let (upstream, home, upstream_proxy, http) = {
+    let (upstream, home, upstream_proxy, http, state_miss_policy, request_settings) = {
         let settings = app.settings.lock().await;
         (
             settings.upstream.clone(),
             settings.codex_home.clone(),
             settings.upstream_proxy.clone(),
             app.http.lock().await.clone(),
+            settings.state_miss_policy,
+            settings.clone(),
         )
     };
     let effective_proxy = fetch::outbound_proxy_for_client(&upstream_proxy);
     *details = logs::network_details(&upstream, &effective_proxy);
+    details.state_policy = Some(state_miss_policy);
     let (mut parts, body) = req.into_parts();
     let target = join_upstream(&upstream, &parts.uri)?;
     let path = parts.uri.path();
@@ -1352,18 +1422,30 @@ async fn forward_http_tracked(
         }
 
         let client_already_has = turn_state::has_http_turn_state(&parts.headers);
-        if client_already_has {
-            let store = app.turn_state.lock().await;
+        if state_miss_policy == StateMissPolicy::StripAll {
+            parts.headers.remove(turn_state::HEADER_NAME);
+            details.turn_state_action = "removed_all_policy".into();
+        } else if state_miss_policy == StateMissPolicy::Passthrough {
+            details.turn_state_action = if client_already_has { "preserved_by_policy" } else { "initial_request" }.into();
+            details.turn_state_len = parts.headers.get(turn_state::HEADER_NAME)
+                .and_then(|value| value.to_str().ok()).map(str::trim).filter(|value| !value.is_empty()).map(str::len);
+        } else if client_already_has {
             // Match the immutable outgoing credential snapshot, not the latest UI account.
-            let token = if effective_account.as_deref().is_some_and(|id| store.is_bound_to_account(id)) {
-                request_model.as_deref().and_then(|model| store.peek_for_model(model))
-            } else {
-                // 无法识别模型时不注入，保留客户端原 token
-                None
+            let mut token = {
+                let store = app.turn_state.lock().await;
+                if effective_account.as_deref().is_some_and(|id| store.is_bound_to_account(id)) {
+                    request_model.as_deref().and_then(|model| store.peek_for_model(model))
+                } else {
+                    None
+                }
             };
+            let waited = token.is_none() && state_miss_policy == StateMissPolicy::Wait;
+            if waited {
+                token = Some(wait_for_request_state(app, &request_settings, effective_account.as_deref(), request_model.as_deref(), details).await?);
+            }
             if let Some(token) = token {
                 turn_state::apply_http_header(&mut parts.headers, &token);
-                details.turn_state_action = "replaced".into();
+                details.turn_state_action = if waited { "replaced_after_wait" } else { "replaced" }.into();
                 details.turn_state_len = Some(token.len());
                 eprintln!(
                     "[stamp] 替换 turn_state → token len={} model={:?} 到 {} {}",
@@ -1373,6 +1455,9 @@ async fn forward_http_tracked(
                     path
                 );
                 injected_token = Some(token);
+            } else if state_miss_policy == StateMissPolicy::Strip {
+                parts.headers.remove(turn_state::HEADER_NAME);
+                details.turn_state_action = "removed_by_policy".into();
             } else if account_changed {
                 parts.headers.remove(turn_state::HEADER_NAME);
                 details.turn_state_action = "removed_account_mismatch".into();
@@ -1397,12 +1482,16 @@ async fn forward_http_tracked(
         } else {
             details.turn_state_action = "initial_request".into();
             eprintln!(
-                "[stamp] 首次请求，不注入 turn_state（等服务端下发） {} {} model={:?}",
+                "[stamp] 客户端未携带 State，不主动注入 {} {} model={:?}",
                 parts.method, path, request_model
             );
         }
     } else {
         details.turn_state_action = "not_applicable".into();
+        if state_miss_policy == StateMissPolicy::StripAll {
+            parts.headers.remove(turn_state::HEADER_NAME);
+            details.turn_state_action = "removed_all_policy".into();
+        }
     }
     let mut builder = http
         .request(
@@ -1525,6 +1614,10 @@ mod upstream_proxy_tests;
 #[cfg(test)]
 #[path = "account_switch_tests.rs"]
 mod account_switch_tests;
+
+#[cfg(test)]
+#[path = "state_policy_tests.rs"]
+mod state_policy_tests;
 
 #[cfg(test)]
 mod tests {

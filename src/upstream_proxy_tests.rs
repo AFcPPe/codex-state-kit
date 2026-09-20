@@ -40,6 +40,7 @@ async fn streaming_proxy() -> (
 
 fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
     SettingsPatch {
+        state_miss_policy: settings.state_miss_policy,
         proxy_listen: settings.proxy_listen.clone(),
         upstream: settings.upstream.clone(),
         codex_home: settings.codex_home.clone(),
@@ -276,9 +277,9 @@ async fn verify_response_metrics() {
         "body_error",
         "cancel_headers",
     ] {
-        let preamble = b"data: {\"type\":\"response.created\"}\n\n";
+        let preamble = b"data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5.6-sol\"}}\n\n";
         let delta = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
-        let end = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":120}}}\n\ndata: [DONE]\n\n";
+        let end = b"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-6-sol\",\"usage\":{\"output_tokens\":120}}}\n\ndata: [DONE]\n\n";
         let compressed = outcome.starts_with("zstd");
         let (preamble, delta, end) = if compressed {
             use std::io::Write;
@@ -397,6 +398,7 @@ async fn verify_response_metrics() {
         let mut stream = response.into_body().into_data_stream();
         send.send(preamble.to_vec()).await.unwrap();
         assert_eq!(&stream.next().await.unwrap().unwrap()[..], preamble);
+        assert_eq!(app.logs.lock().await.back().unwrap().upstream_response_model.as_deref(), Some("gpt-5.6-sol"));
         assert!(app
             .logs
             .lock()
@@ -446,6 +448,8 @@ async fn verify_response_metrics() {
                 assert!(!entry.in_progress);
                 assert_eq!(entry.id, initial.id);
                 assert_eq!(entry.output_tokens, Some(120));
+                assert_eq!(entry.upstream_response_model.as_deref(), Some("gpt-6-sol"));
+                assert_eq!(serde_json::to_value(entry).unwrap()["upstreamResponseModel"], "gpt-6-sol");
                 assert!(entry.ms > entry.first_token_ms.unwrap());
                 assert_eq!(
                     entry.tokens_per_second,
@@ -467,6 +471,7 @@ async fn verify_response_metrics() {
                 .unwrap();
                 let entry = app.logs.lock().await.back().cloned().unwrap();
                 assert_eq!(entry.error_kind.as_deref(), Some("client_cancelled"));
+                assert_eq!(entry.upstream_response_model.as_deref(), Some("gpt-5.6-sol"));
                 assert!(entry.first_token_ms.is_some());
                 assert!(entry.tokens_per_second.is_none());
                 drop(send);
